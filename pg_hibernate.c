@@ -12,38 +12,51 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 
-/* Includes needed for this plugin */
+/* Header files needed by this plugin */
+#include "access/xact.h"
+#include "commands/dbcommands.h"
 #include "fmgr.h"
 #include "nodes/pg_list.h"
+#include "pgstat.h"
 #include "storage/block.h"
+#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "storage/relfilenode.h"
 #include "utils/guc.h"
+#include "utils/snapmgr.h"
 
-typedef struct SavedRelation
+typedef struct SavedBuffer
 {
-	Oid			filenode;
-	ForkNumber	forknum;
-	BlockNumber	block;
-
-}SavedRelation;
+	Oid			database;
+	Oid			filenode;	/* Stream marker: 'r' */
+	ForkNumber	forknum;	/* Stream marker: 'f' */
+	BlockNumber	blocknum;	/* Stream marker: 'b' */
+							/* Stream marker: 'N' for range of blocks */
+} SavedBuffer;
 
 /* Forward declarations */
 static void		DefineGUCs(void);
 static void		CreateDirectory(void);
 static List*	ReadDirectory(void);
 static List*	ReadSavedFile(unsigned int i, char **dbname);
-static void		RestoreRelation(SavedRelation *r); // RelidByRelfilenode()
+static void		RestoreRelation(SavedBuffer *r);
 static void		SaveBuffers(void);
 static void		CreateWorkers(void);
 static void		CreateWorker(int id);
 static char*	getSaveDirName();
+static char*	getDatabseSaveFileName(int database_number, char *dbname);
 static void		WorkerMain(Datum main_arg);
 static void		BufferSaverMain(Datum main_arg);
+static int		SavedBufferCmp(const void *a, const void *b);
 
 PG_MODULE_MAGIC;
 
 void	_PG_init(void);
+
+/*
+ * TODO: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
+ * because the worker processes are not supposed to live beyond an error anyway.
+ */
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
@@ -83,8 +96,6 @@ sighupHandler(SIGNAL_ARGS)
 		SetLatch(&MyProc->procLatch);
 }
 
-#define SAVE_LOCATION "hibernate"
-
 void
 _PG_init(void)
 {
@@ -121,18 +132,28 @@ DefineGUCs(void)
 							NULL);
 }
 
+#define SAVE_LOCATION "pg_hibernate"
+
 static char*
 getSaveDirName()
 {
-	static char	hibernate_dir[MAXPGPATH];
-	int			nbytes = strlen(SAVE_LOCATION) + 1;
+	static char	hibernate_dir[sizeof(SAVE_LOCATION) + 1];
 
-	if (hibernate_dir[0] != '\0')
-		snprintf(hibernate_dir, nbytes, "%s", SAVE_LOCATION);
+	if (hibernate_dir[0] == '\0')
+		snprintf(hibernate_dir, sizeof(hibernate_dir), "%s", SAVE_LOCATION);
 
 	return hibernate_dir;
 }
 
+static char*
+getDatabseSaveFileName(int database_number, char *dbname)
+{
+	char *ret = palloc(MAXPGPATH);
+
+	snprintf(ret, MAXPGPATH, "%s/%d.%s.save", getSaveDirName(), database_number, dbname);
+
+	return ret;
+}
 
 static void
 CreateDirectory(void)
@@ -146,9 +167,8 @@ CreateDirectory(void)
 		if (!S_ISDIR(st.st_mode))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("\"%s\" exists but is not a directory. Disabling hibernation.",
+					 errmsg("\"%s\" exists but is not a directory, hence disabling hibernation",
 							hibernate_dir)));
-
 	}
 	else
 	{
@@ -209,7 +229,7 @@ CreateWorker(int id)
 	worker.bgw_restart_time	= id == 0 ? 0 : BGW_NEVER_RESTART;
 	worker.bgw_main			= id == 0 ? BufferSaverMain : WorkerMain;
 
-	snprintf(worker.bgw_name, BGW_MAXLEN, "Hibernate Restorer %d", id);
+	snprintf(worker.bgw_name, BGW_MAXLEN, id == 0 ? "Hibernate Buffer Saver" : "Hibernate Restorer %d", id);
 	worker.bgw_main_arg = Int32GetDatum(id);
 
 	RegisterBackgroundWorker(&worker);
@@ -253,7 +273,7 @@ WorkerMain(Datum main_arg)
 		ereport(ERROR,
 				(errmsg("hibernate worker %d could not find its save file", index)));
 
-	/* Honor SIGTERM and SIGHUP signals in this worker, too. */
+	/* TODO: Honor SIGTERM and SIGHUP signals in this worker, too. */
 	/* We found the file we're supposed to restore. */
 	FreeDir(dir);
 }
@@ -300,4 +320,235 @@ BufferSaverMain(Datum main_arg)
 	}
 
 	/* We recieved the SIGTERM, so save the shared-buffer contents */
+	SaveBuffers();
+
+	/* The worker exits here. A proc_exit(0) is not necessary, let the caller do that. */
+}
+
+static void
+SaveBuffers(void)
+{
+	int					i;
+	int					num_buffers;
+	SavedBuffer		   *saved_buffers;
+	volatile BufferDesc *bufHdr;			// XXX: Do we really need volatile here?
+	FILE			   *file			= NULL;
+	int					database_number;
+	Oid					prev_database	= InvalidOid;
+	Oid					prev_filenode	= InvalidOid;
+	ForkNumber			prev_forknum	= InvalidForkNumber;
+	BlockNumber			prev_blocknum	= InvalidBlockNumber;
+	uint				range_counter	= 0;
+
+	/*
+	 * Allocations larger than AllocSizeIsValid() are denied by palloc(), so we use
+	 * malloc(), instead. Besides, we're going to exit after this operation anyway,
+	 * so we don't need no stinkin' memory manager.
+	 *
+	 * Note that the biggest size allowed by AllocSizeIsValid() is 1 GB, using which
+	 * we can manage about 682 GB worth of shared_buffers (given Oid, Forknumber
+	 * and BlockNumber are all 4 byte), but we still use plain malloc() because we
+	 * don't need memory management at the end of life of this process.
+	 *
+	 * TODO: If the memory request fails, ask for a smaller memory chunk, and use it
+	 * to create chunks of save-files, and make the workers read those chunks.
+	 */
+
+	saved_buffers = (SavedBuffer *) malloc(sizeof(SavedBuffer) * NBuffers);
+
+	/* Lock the buffer partitions */
+	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
+		LWLockAcquire(FirstBufMappingLock + i, LW_SHARED);
+
+	/* Scan an save a list of valid buffers. */
+	for (num_buffers = 0, i = 0, bufHdr = BufferDescriptors; i < NBuffers; ++i, ++bufHdr)
+	{
+		/* Lock each buffer header before inspecting. */
+		LockBufHdr(bufHdr);
+
+		/* Skip invalid buffers */
+		if ( ((bufHdr->flags & BM_VALID) && (bufHdr->flags & BM_TAG_VALID)))
+		{
+			saved_buffers[i].database	= bufHdr->tag.rnode.dbNode;
+			saved_buffers[i].filenode	= bufHdr->tag.rnode.relNode;
+			saved_buffers[i].forknum		= bufHdr->tag.forkNum;
+			saved_buffers[i].blocknum	= bufHdr->tag.blockNum;
+
+			++num_buffers;
+		}
+
+		UnlockBufHdr(bufHdr);
+	}
+
+	/*
+	 * Unlock the buffer partitions in reverse order, to avoid deadlock. Although
+	 * this function is called during shutdown, and one would expect us to be alone,
+	 * but that may not be true, as other user/worker backends may still be alive,
+	 * just as we are. Also, it doensn't hurt to follow the protocol.
+	 */
+	for (i = NUM_BUFFER_PARTITIONS; --i >= 0;)
+		LWLockRelease(FirstBufMappingLock + i);
+
+	/* Sort the buffers, so that we can optimize the storage of these buffers. */
+	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
+
+	/*
+	 * Number 0 is reserved; In CreateWorkers(), 0 is used to identify and register
+	 * the BufferSaver.
+	 */
+	database_number = 1;
+
+	/*
+	 * TODO: Figure out why we need a default DB here. The autovacuum-launcher
+	 * seems to do fine without it! See InitPostgres(NULL, InvalidOid, NULL, NULL)
+	 * call in autovacuum.c
+	 */
+	BackgroundWorkerInitializeConnection(default_database, NULL);
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	pgstat_report_activity(STATE_RUNNING, "saving buffers");
+
+	for (i = 0; i < num_buffers; ++i)
+	{
+		SavedBuffer *buf = &saved_buffers[i];
+
+		if (buf->database == 0)
+		{
+			/* Special case for global objects */
+
+			/*
+			 * We use fopen(), rather than AllocateFile(), becuase AllocateFile()
+			 * uses transaction context, and I'm not comfortable adding that
+			 * dependency here.
+			 */
+			file = fopen(getDatabseSaveFileName(database_number, "global"), PG_BINARY_W);
+
+			if (file == NULL)
+				ereport(FATAL,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("could not create save-file for global objects")));
+		}
+		else if (buf->database != prev_database)
+		{
+			char *dbname;
+
+			/*
+			 * We are beginning to process a different database than the previous one;
+			 * close the save-file of previous database, and open a new one.
+			 */
+			++database_number;
+
+			dbname = get_database_name(buf->database);
+
+			Assert(dbname != NULL);
+
+			Assert(file != NULL);
+			fclose(file);
+			file = fopen(getDatabseSaveFileName(database_number, dbname), PG_BINARY_W);
+
+			if (file == NULL)
+				ereport(FATAL,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("could not create save-file for %s database", dbname)));
+
+			pfree(dbname);
+
+			/* Reset trackers appropriately */
+			prev_database	= buf->database;
+			prev_filenode	= InvalidOid;
+			prev_forknum	= InvalidForkNumber;
+			prev_blocknum	= InvalidBlockNumber;
+			range_counter	= 0;
+		}
+
+		if (buf->filenode != prev_filenode)
+		{
+			/*
+			 * We're beginning to process a new relation; add a marker for this
+			 * relation.
+			 */
+
+			fwrite("r", 1, 1, file);
+			fwrite(&(buf->filenode), sizeof(Oid), 1, file);
+
+			/* Reset trackers appropriately */
+			prev_filenode	= buf->filenode;
+			prev_forknum	= InvalidForkNumber;
+			prev_blocknum	= InvalidBlockNumber;
+			range_counter	= 0;
+		}
+
+		if (buf->forknum != prev_forknum)
+		{
+			/* We're beginning to process a new fork of this relation; add a marker
+			 * for this fork.
+			 */
+
+			fwrite("f", 1, 1, file);
+			fwrite(&(buf->forknum), sizeof(ForkNumber), 1, file);
+
+			/* Reset trackers appropriately */
+			prev_forknum	= buf->forknum;
+			prev_blocknum	= InvalidBlockNumber;
+			range_counter	= 0;
+		}
+
+		if (buf->blocknum != InvalidBlockNumber
+			&& buf->blocknum + range_counter + 1 == prev_blocknum)
+		{
+			/* We're processing a range of consecutive blocks of the relation. */
+			++range_counter;
+		}
+		else
+		{
+			/*
+			 * We encountered a block that's not in the continuous range of the
+			 * previous block. Emit a marker for the previous range, if any, and
+			 * then emit a marker for this block.
+			 */
+			if (range_counter != 0)
+			{
+				fwrite("N", 1, 1, file);
+				fwrite(&range_counter, sizeof(range_counter), 1, file);
+			}
+
+			fwrite("b", 1, 1, file);
+			fwrite(&(buf->blocknum), sizeof(BlockNumber), 1, file);
+
+			/* Reset trackers appropriately */
+			prev_blocknum	= buf->blocknum;
+			range_counter	= 0;
+		}
+	}
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+
+	Assert(file != NULL);
+	fclose(file);
+	free(saved_buffers);
+}
+
+#define svdbfrcmp(fld)			\
+	if (a->fld < b->fld)		\
+		return -1;				\
+	else if (a->fld > b->fld)	\
+		return 1;
+
+static int
+SavedBufferCmp(const void *p, const void *q)
+{
+	SavedBuffer *a = (SavedBuffer *) p;
+	SavedBuffer *b = (SavedBuffer *) q;
+
+	svdbfrcmp(database);
+	svdbfrcmp(filenode);
+	svdbfrcmp(forknum);
+	svdbfrcmp(blocknum);
+
+	Assert(false);	// No two buffers should be storing identical page
+
+	return 0;	// Keep compiler happy.
 }
