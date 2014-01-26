@@ -276,6 +276,9 @@ WorkerMain(Datum main_arg)
 	/* TODO: Honor SIGTERM and SIGHUP signals in this worker, too. */
 	/* We found the file we're supposed to restore. */
 	FreeDir(dir);
+
+	/* Exit with non-zero status to ensure that this worker is not restarted */
+	proc_exit(1);
 }
 
 static void
@@ -341,20 +344,11 @@ SaveBuffers(void)
 	uint				range_counter	= 0;
 
 	/*
-	 * Allocations larger than AllocSizeIsValid() are denied by palloc(), so we use
-	 * malloc(), instead. Besides, we're going to exit after this operation anyway,
-	 * so we don't need no stinkin' memory manager.
-	 *
-	 * Note that the biggest size allowed by AllocSizeIsValid() is 1 GB, using which
-	 * we can manage about 682 GB worth of shared_buffers (given Oid, Forknumber
-	 * and BlockNumber are all 4 byte), but we still use plain malloc() because we
-	 * don't need memory management at the end of life of this process.
-	 *
 	 * TODO: If the memory request fails, ask for a smaller memory chunk, and use it
 	 * to create chunks of save-files, and make the workers read those chunks.
 	 */
 
-	saved_buffers = (SavedBuffer *) malloc(sizeof(SavedBuffer) * NBuffers);
+	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
 
 	/* Lock the buffer partitions */
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
@@ -443,6 +437,11 @@ SaveBuffers(void)
 
 			Assert(dbname != NULL);
 
+			/*
+			 * Ensure that this is not the first database we process. This assertion
+			 * is not really necessary, but it cements our assumption that the qsort
+			 * above brings the global objects to the front.
+			 */
 			Assert(file != NULL);
 			fclose(file);
 			file = fopen(getDatabseSaveFileName(database_number, dbname), PG_BINARY_W);
@@ -528,7 +527,7 @@ SaveBuffers(void)
 
 	Assert(file != NULL);
 	fclose(file);
-	free(saved_buffers);
+	pfree(saved_buffers);
 }
 
 #define svdbfrcmp(fld)			\
