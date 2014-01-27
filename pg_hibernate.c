@@ -331,8 +331,23 @@ WorkerMain(Datum main_arg)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "restoring buffers");
 
-	while (fread(&record_type, 1, 1, file) != EOF)
+	while (!ferror(file))
 	{
+		if (fread(&record_type, 1, 1, file) != 1)
+		{
+			/* Most-likely end-of-file */
+			if (rel)
+			{
+				relation_close(rel, AccessShareLock);
+				rel = NULL;
+			}
+			/*
+			 * If it is feof() we're good, but if it is ferror(), the check after
+			 * the loop will take care of it.
+			 */
+			break;
+		}
+
 		switch (record_type)
 		{
 			case 'r':
@@ -356,7 +371,8 @@ WorkerMain(Datum main_arg)
 				
 				relOid = GetRelOid(record_filenode);
 
-				ereport(LOG, (errmsg("processing filenode %d, relation %d", record_filenode, relOid)));
+				ereport(DEBUG3, (errmsg("processing filenode %d, relation %d",
+										record_filenode, relOid)));
 				/*
 				 * If the relation has been rewritten/dropped since we saved it,
 				 * just skip it and process the next relation.
@@ -492,6 +508,9 @@ WorkerMain(Datum main_arg)
 			break;
 		}
 	}
+	if (ferror(file))
+		ereport(ERROR,
+				(errmsg("error reading save-file of %s : %m", dbname)));
 
 	SPI_finish();
 	PopActiveSnapshot();
