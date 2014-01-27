@@ -267,7 +267,7 @@ WorkerMain(Datum main_arg)
 	ForkNumber			record_forknum;
 	BlockNumber			record_blocknum;
 	int					record_range;
-	
+
 	Oid					relOid;
 	Relation				rel = NULL;
 	bool				skip_relation = false;
@@ -293,10 +293,10 @@ WorkerMain(Datum main_arg)
 			continue;	/* Skip if the name doesn't match the format we're expecting */
 
 		dbname_len = strlen(dbname);
-		
+
 		if (strcmp(&dbname[dbname_len - 5], ".save") != 0)
 			continue;	/* Skip if the name doesn't match the format we're expecting */
-		
+
 		dbname[dbname_len - 5] = '\0';
 
 		if (number == index)
@@ -310,12 +310,10 @@ WorkerMain(Datum main_arg)
 				(errmsg("hibernate worker %d could not find its save-file", index)));
 	}
 	FreeDir(dir);
-	
+
 	/* TODO: Honor SIGTERM and SIGHUP signals in this worker, too. */
 
 	/* We found the file we're supposed to restore. */
-
-	//{bool stop = true; while(stop)pg_usleep(1000*1000);}
 
 	/* TODO: getDatabseSaveFileName() call leaks memory. */
 	file = fopen(getDatabseSaveFileName(number, dbname), PG_BINARY_R);
@@ -368,7 +366,7 @@ WorkerMain(Datum main_arg)
 							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 							errmsg("error reading save-file of %s", dbname)));
 				}
-				
+
 				relOid = GetRelOid(record_filenode);
 
 				ereport(DEBUG3, (errmsg("processing filenode %d, relation %d",
@@ -382,7 +380,7 @@ WorkerMain(Datum main_arg)
 				else
 				{
 					skip_relation = false;
-					
+
 					/* Open the relation */
 					rel = relation_open(relOid, AccessShareLock);
 					RelationOpenSmgr(rel);
@@ -410,13 +408,13 @@ WorkerMain(Datum main_arg)
 				}
 
 				ereport(LOG, (errmsg("processing fork %d", record_forknum)));
-				
+
 				if (!smgrexists(rel->rd_smgr, record_forknum))
 					skip_fork = true;
 				else
 				{
 					skip_fork = false;
-				
+
 					nblocks = RelationGetNumberOfBlocksInFork(rel, record_forknum);
 				}
 			}
@@ -466,7 +464,7 @@ WorkerMain(Datum main_arg)
 
 				if (skip_relation || skip_fork || skip_block)
 					continue;
-				
+
 				Assert(record_blocknum != InvalidBlockNumber);
 				if (rel == NULL)
 					ereport(ERROR,
