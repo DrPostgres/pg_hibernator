@@ -28,6 +28,8 @@
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
 
+PG_MODULE_MAGIC;
+
 typedef struct SavedBuffer
 {
 	Oid			database;
@@ -38,25 +40,32 @@ typedef struct SavedBuffer
 } SavedBuffer;
 
 /* Forward declarations */
+
+#define SAVE_LOCATION "pg_hibernate"
+
+/* Primary functions */
+void			_PG_init(void);
 static void		DefineGUCs(void);
 static void		CreateDirectory(void);
-static List*	ReadDirectory(void);
-static List*	ReadSavedFile(unsigned int i, char **dbname);
-static void		RestoreRelation(SavedBuffer *r);
-static void		SaveBuffers(void);
+
 static void		CreateWorkers(void);
 static void		CreateWorker(int id);
-static char*	getSaveDirName();
-static char*	getDatabseSaveFileName(int database_number, char *dbname);
-static void		WorkerCommon(void);
-static void		WorkerMain(Datum main_arg);
+
+static void		BlockReaderMain(Datum main_arg);
+static void		ReadBlocks(int number, char *dbname);
+
 static void		BufferSaverMain(Datum main_arg);
+static void		SaveBuffers(void);
+
+/* Secondary/supporting functions */
+static void		sigtermHandler(SIGNAL_ARGS);
+static void		sighupHandler(SIGNAL_ARGS);
+static const char* getSaveDirName();
+static const char* getDatabseSaveFileName(int number, const char* const dbname);
+static void		WorkerCommon(void);
 static int		SavedBufferCmp(const void *a, const void *b);
 static Oid		GetRelOid(Oid filenode);
-
-PG_MODULE_MAGIC;
-
-void	_PG_init(void);
+static bool		parseSaveFileName(const char *fname, int * number, char *dbname);
 
 /*
  * TODO: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
@@ -124,7 +133,6 @@ DefineGUCs(void)
 							NULL,
 							NULL);
 
-	/* TODO: Remove this GUC; doesn't seem to be useful, as of now. */
 	DefineCustomStringVariable("hibernate.default_db",
 							"Default database to connect to.",
 							NULL,
@@ -137,9 +145,8 @@ DefineGUCs(void)
 							NULL);
 }
 
-#define SAVE_LOCATION "pg_hibernate"
-
-static char*
+/* We use static arrays in these functions, because the returned pointers */
+static const char*
 getSaveDirName()
 {
 	static char	hibernate_dir[sizeof(SAVE_LOCATION) + 1];
@@ -150,29 +157,48 @@ getSaveDirName()
 	return hibernate_dir;
 }
 
-static char*
-getDatabseSaveFileName(int database_number, char *dbname)
+static const char*
+getDatabseSaveFileName(int number, const char *dbname)
 {
-	char *ret = palloc(MAXPGPATH);
+	static char ret[MAXPGPATH];
 
-	snprintf(ret, MAXPGPATH, "%s/%d.%s.save", getSaveDirName(), database_number, dbname);
+	snprintf(ret, sizeof(ret), "%s/%d.%s.save", getSaveDirName(), number, dbname);
 
 	return ret;
+}
+
+static bool
+parseSaveFileName(const char *fname, int *number, char *dbname)
+{
+	int dbname_len;
+
+	/* The save-file names are supposed to be in the format <integer>.<dbname>.save */
+
+	if (sscanf(fname, "%d.%s", number, dbname) != 2)
+		return false;	/* Fail if the name doesn't match the format we're expecting */
+
+	dbname_len = strlen(dbname);
+
+	if (strcmp(&dbname[dbname_len - 5], ".save") != 0)
+		return false;	/* Fail if the name doesn't match the format we're expecting */
+
+	dbname[dbname_len - 5] = '\0';
+
+	return true;
 }
 
 static void
 CreateDirectory(void)
 {
-	struct stat	st;
-	char	   *hibernate_dir = getSaveDirName();
+	struct stat		st;
+	const char	   *hibernate_dir = getSaveDirName();
 
 	if (stat(hibernate_dir, &st) == 0)
 	{
-		/* Is it a directory? */
+		/* Is it not a directory? */
 		if (!S_ISDIR(st.st_mode))
 			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("\"%s\" exists but is not a directory, hence disabling hibernation",
+					(errmsg("\"%s\" exists but is not a directory, hence disabling hibernation",
 							hibernate_dir)));
 	}
 	else
@@ -197,11 +223,24 @@ CreateDirectory(void)
 static void
 CreateWorkers(void)
 {
-	DIR				   *dir;
-	char			   *hibernate_dir = getSaveDirName();
-	struct dirent	   *dent;
+	DIR			   *dir;
+	const char	   *hibernate_dir;
+	struct dirent   *dent;
 
+	/*
+	 * Create the buffer-saver irrespective of whether the extension is enabled. The
+	 * buffer-saver will check the flag when it receives SIGTERM, and act accordingly.
+	 * This is done so that the user can start the server with the extension disabled,
+	 * enable the extension while server is running, and expect the save-files to be
+	 * created when the server shuts down.
+	 */
 	CreateWorker(0);	/* Create the buffer-saver worker */
+
+	/* Don't create block-readers if the extension is disabled. */
+	if (!hibernate_enabled)
+		return;
+
+	hibernate_dir = getSaveDirName();
 
     dir = AllocateDir(hibernate_dir);
     if (dir == NULL)
@@ -214,8 +253,8 @@ CreateWorkers(void)
 		int		number;
 		char	dbname[NAMEDATALEN];
 
-		if (sscanf(dent->d_name, "%d.%s.save", &number, dbname) != 2)
-			continue;	/* Skip if the name doesn't match the format we're expecting */
+		if (!parseSaveFileName(dent->d_name, &number, dbname))
+			continue;
 
 		CreateWorker(number);
     }
@@ -228,13 +267,23 @@ CreateWorker(int id)
 {
 	BackgroundWorker	worker;
 
-	/* TODO: See if we can avoid the database-connection bit */
-	worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time	= BgWorkerStart_ConsistentState;
-	worker.bgw_restart_time	= id == 0 ? 0 : BGW_NEVER_RESTART;
-	worker.bgw_main			= id == 0 ? BufferSaverMain : WorkerMain;
+	if (id == 0)
+	{
+		worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
+		worker.bgw_restart_time	= 0;	/* Keep the BufferSaver running */
+		worker.bgw_main			= BufferSaverMain;
+		snprintf(worker.bgw_name, BGW_MAXLEN, "Hibernate Buffer Saver");
+	}
+	else
+	{
+		worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
+		worker.bgw_restart_time	= BGW_NEVER_RESTART;	/* Don't restart readers upon error */
+		worker.bgw_main			= BlockReaderMain;
+		snprintf(worker.bgw_name, BGW_MAXLEN, "Hibernate Block Reader %d", id);
+	}
 
-	snprintf(worker.bgw_name, BGW_MAXLEN, id == 0 ? "Hibernate Buffer Saver" : "Hibernate Restorer %d", id);
 	worker.bgw_main_arg = Int32GetDatum(id);
 
 	RegisterBackgroundWorker(&worker);
@@ -252,29 +301,14 @@ WorkerCommon(void)
 }
 
 static void
-WorkerMain(Datum main_arg)
+BlockReaderMain(Datum main_arg)
 {
 	int					index = DatumGetInt32(main_arg);
 	DIR				   *dir;
-	char			   *hibernate_dir = getSaveDirName();
-	FILE			   *file;
+	const char		   *hibernate_dir = getSaveDirName();
 	struct dirent	   *dent;
 	int					number;
 	char				dbname[NAMEDATALEN];
-
-	char				record_type;
-	Oid					record_filenode;
-	ForkNumber			record_forknum;
-	BlockNumber			record_blocknum;
-	int					record_range;
-
-	Oid					relOid;
-	Relation				rel = NULL;
-	bool				skip_relation = false;
-	bool				skip_fork = false;
-	bool				skip_block = false;
-	int64				nblocks = 0;
-	char				blockbuffer[BLCKSZ];
 
 	WorkerCommon();
 
@@ -282,22 +316,13 @@ WorkerMain(Datum main_arg)
     if (dir == NULL)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("hibernate worker %d could not open directory \"%s\": %m",
+				 errmsg("block-reader worker %d could not open directory \"%s\": %m",
 						index, hibernate_dir)));
 
     while ((dent = ReadDir(dir, hibernate_dir)) != NULL)
     {
-		int dbname_len;
-
-		if (sscanf(dent->d_name, "%d.%s", &number, dbname) != 2)
-			continue;	/* Skip if the name doesn't match the format we're expecting */
-
-		dbname_len = strlen(dbname);
-
-		if (strcmp(&dbname[dbname_len - 5], ".save") != 0)
-			continue;	/* Skip if the name doesn't match the format we're expecting */
-
-		dbname[dbname_len - 5] = '\0';
+		if (!parseSaveFileName(dent->d_name, &number, dbname))
+			continue;
 
 		if (number == index)
 			break;
@@ -307,21 +332,56 @@ WorkerMain(Datum main_arg)
 	{
 		FreeDir(dir);
 		ereport(ERROR,
-				(errmsg("hibernate worker %d could not find its save-file", index)));
+				(errmsg("block-reader %d could not find its save-file", index)));
 	}
 	FreeDir(dir);
 
-	/* TODO: Honor SIGTERM and SIGHUP signals in this worker, too. */
-
 	/* We found the file we're supposed to restore. */
+	ReadBlocks(number, dbname);
 
-	/* TODO: getDatabseSaveFileName() call leaks memory. */
-	file = fopen(getDatabseSaveFileName(number, dbname), PG_BINARY_R);
+	/*
+	 * Exit with non-zero status to ensure that this worker is not restarted.
+	 *
+	 * For any backend connected to shared-buffers, an exit code other than 0 or 1
+	 * causes a system-wide restart, so we have no choice but to use 1. Since an
+	 * ERROR also causes exit code 1, it would've been nice if we could use some
+	 * other code to signal normal exit.
+	 *
+	 * To get around this limitation we resort to logging a message to server log;
+	 * this message should console the user that everything went okay, even though
+	 * the exit code is 1.
+	 */
+	ereport(LOG, (errmsg("block-reader %d read all blocks successfully", index)));
+	proc_exit(1);
+}
+
+static void
+ReadBlocks(int number, char *dbname)
+{
+	FILE	   *file;
+	char		record_type;
+	Oid			record_filenode;
+	ForkNumber	record_forknum;
+	BlockNumber	record_blocknum;
+	int			record_range;
+
+	int			log_level = DEBUG3;
+	Oid			relOid;
+	Relation	rel = NULL;
+	bool		skip_relation = false;
+	bool		skip_fork = false;
+	bool		skip_block = false;
+	int64		nblocks = 0;
+	char	   *filename;
+
+	filename = getDatabseSaveFileName(number, dbname);
+	file = fopen(filename, PG_BINARY_R);
 	if (file == NULL)
 		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				errmsg("could not open save-file for %s", dbname)));
+				(errcode_for_file_access(),
+				 errmsg("could not open save-file for database \"%s\": %m", dbname)));
 
+	/* To restore the global objects, use default database */
 	BackgroundWorkerInitializeConnection(number == 1 ? default_database : dbname, NULL);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -331,14 +391,34 @@ WorkerMain(Datum main_arg)
 
 	while (!ferror(file))
 	{
+		/* If we want to process the signals, this seems to be the best place to do
+		 * it. Generally the backends refrain from processing config file while in
+		 * transaction, but that's more for the fear of allowing GUC changes to
+		 * affect expression evaluation, causing different results in the same
+		 * transaction. Since this worker is not processing any queries, it is okay
+		 * to process the config file here.
+		 *
+		 * Even though it's okay to process SIGHUP here, doing so doesn't add any
+		 * value. The only reason we might want to process config file here would
+		 * be to allow the user to interrupt the block-reader's operation by
+		 * changing this extenstion's GUC parameter. But the user can do that
+		 * anyway, using SIGTERM or pg_terminate_backend().
+		 */
+
+		/* Stop processing the save-file if the Postmaster wants us to die. */
+		if (got_sigterm)
+			break;
+
 		if (fread(&record_type, 1, 1, file) != 1)
 		{
-			/* Most-likely end-of-file */
+			/* Most likely it's because we reached end-of-file */
+
 			if (rel)
 			{
 				relation_close(rel, AccessShareLock);
 				rel = NULL;
 			}
+
 			/*
 			 * If it is feof() we're good, but if it is ferror(), the check after
 			 * the loop will take care of it.
@@ -361,15 +441,13 @@ WorkerMain(Datum main_arg)
 				record_blocknum = InvalidBlockNumber;
 
 				if (fread(&record_filenode, sizeof(Oid), 1, file) != 1)
-				{
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("error reading save-file of %s", dbname)));
-				}
+							(errcode_for_file_access(),
+							errmsg("error reading save-file of \"%s\" : %m", dbname)));
 
 				relOid = GetRelOid(record_filenode);
 
-				ereport(DEBUG3, (errmsg("processing filenode %d, relation %d",
+				ereport(log_level, (errmsg("processing filenode %d, relation %d",
 										record_filenode, relOid)));
 				/*
 				 * If the relation has been rewritten/dropped since we saved it,
@@ -397,17 +475,14 @@ WorkerMain(Datum main_arg)
 				Assert(rel != NULL);
 				if (rel == NULL)
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("found a fork marker without a preceeding relation marker")));
+							(errmsg("found a fork marker without a preceeding relation marker")));
 
 				if (fread(&record_forknum, sizeof(ForkNumber), 1, file) != 1)
-				{
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("error reading save-file of %s", dbname)));
-				}
+							(errcode_for_file_access(),
+							errmsg("error reading save-file of \"%s\" : %m", dbname)));
 
-				ereport(LOG, (errmsg("processing fork %d", record_forknum)));
+				ereport(log_level, (errmsg("processing fork %d", record_forknum)));
 
 				if (!smgrexists(rel->rd_smgr, record_forknum))
 					skip_fork = true;
@@ -427,34 +502,37 @@ WorkerMain(Datum main_arg)
 				Assert(rel != NULL);
 				if (rel == NULL)
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("found a block marker without a preceeding relation marker")));
+							(errmsg("found a block marker without a preceeding relation marker")));
+
 				if (record_forknum == InvalidForkNumber)
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("found a block marker without a preceeding fork marker")));
+							(errmsg("found a block marker without a preceeding fork marker")));
 
 				if (fread(&record_blocknum, sizeof(BlockNumber), 1, file) != 1)
 				{
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("error reading save-file of %s", dbname)));
+							(errcode_for_file_access(),
+							errmsg("error reading save-file of \"%s\" : %m", dbname)));
 				}
-				ereport(LOG, (errmsg("processing block %d", record_blocknum)));
+				ereport(log_level, (errmsg("processing block %d", record_blocknum)));
 
 				/*
 				 * Don't try to read past the file; the file may have been shrunk
 				 * by a vaccum operation.
 				 */
-				if (record_blocknum > nblocks)
+				if (record_blocknum >= nblocks)
 				{
 					skip_block = true;
 					continue;
 				}
 				else
 				{
+					Buffer      buf;
+
 					skip_block = false;
-					smgrread(rel->rd_smgr, record_forknum, record_blocknum, blockbuffer);
+
+					buf = ReadBufferExtended(rel, record_forknum, record_blocknum, RBM_NORMAL, NULL);
+					ReleaseBuffer(buf);
 				}
 			}
 			break;
@@ -468,47 +546,46 @@ WorkerMain(Datum main_arg)
 				Assert(record_blocknum != InvalidBlockNumber);
 				if (rel == NULL)
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("found a block range marker without a preceeding relation marker")));
+							(errmsg("found a block range marker without a preceeding relation marker")));
+
 				if (record_forknum == InvalidForkNumber)
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("found a block range marker without a preceeding fork marker")));
+							(errmsg("found a block range marker without a preceeding fork marker")));
+
 				if (record_blocknum == InvalidBlockNumber)
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("found a block range marker without a preceeding block marker")));
+							(errmsg("found a block range marker without a preceeding block marker")));
 
 				if (fread(&record_range, sizeof(int), 1, file) != 1)
 				{
 					ereport(ERROR,
-							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("error reading save-file of %s", dbname)));
+							(errcode_for_file_access(),
+							errmsg("error reading save-file of \"%s\" : %m", dbname)));
 				}
-				ereport(LOG, (errmsg("processing range %d", record_range)));
+				ereport(log_level, (errmsg("processing range %d", record_range)));
 
-				for (block = record_blocknum; block < (record_blocknum + record_range); ++block)
+				for (block = record_blocknum + 1; block < (record_blocknum + record_range); ++block)
 				{
-					smgrread(rel->rd_smgr, record_forknum, block, blockbuffer);
+					Buffer      buf;
+
+					buf = ReadBufferExtended(rel, record_forknum, block, RBM_NORMAL, NULL);
+					ReleaseBuffer(buf);
 				}
 			}
 			break;
 			default:
 			{
-				ereport(LOG, (errmsg("found unexpected save-file marker %x - %c", record_type, record_type)));
-				continue;
-
 				Assert(false);
 				ereport(ERROR,
-						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("found unexpected save-file marker %x (%c)", record_type, record_type)));
+						(errmsg("found unexpected save-file marker %x - %c)", record_type, record_type)));
 			}
 			break;
 		}
 	}
 	if (ferror(file))
 		ereport(ERROR,
-				(errmsg("error reading save-file of %s : %m", dbname)));
+				(errcode_for_file_access(),
+				errmsg("error reading save-file of \"%s\" : %m", dbname)));
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -517,8 +594,11 @@ WorkerMain(Datum main_arg)
 
 	fclose(file);
 
-	/* Exit with non-zero status to ensure that this worker is not restarted */
-	proc_exit(1);
+	/* Remove the save-file */
+	if (!remove(filename))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				errmsg("error removing save-file of \"%s\" : %m", dbname)));
 }
 
 static void
@@ -558,7 +638,10 @@ BufferSaverMain(Datum main_arg)
 	}
 
 	/* We recieved the SIGTERM, so save the shared-buffer contents */
-	SaveBuffers();
+
+	/* Save the buffers only if the extension is enabled. */
+	if (hibernate_enabled)
+		SaveBuffers();
 
 	/* The worker exits here. A proc_exit(0) is not necessary, let the caller do that. */
 }
@@ -589,14 +672,14 @@ SaveBuffers(void)
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
 		LWLockAcquire(FirstBufMappingLock + i, LW_SHARED);
 
-	/* Scan an save a list of valid buffers. */
+	/* Scan and save a list of valid buffers. */
 	for (num_buffers = 0, i = 0, bufHdr = BufferDescriptors; i < NBuffers; ++i, ++bufHdr)
 	{
 		/* Lock each buffer header before inspecting. */
 		LockBufHdr(bufHdr);
 
 		/* Skip invalid buffers */
-		if ( ((bufHdr->flags & BM_VALID) && (bufHdr->flags & BM_TAG_VALID)))
+		if ((bufHdr->flags & BM_VALID) && (bufHdr->flags & BM_TAG_VALID))
 		{
 			saved_buffers[i].database	= bufHdr->tag.rnode.dbNode;
 			saved_buffers[i].filenode	= bufHdr->tag.rnode.relNode;
@@ -613,7 +696,7 @@ SaveBuffers(void)
 	 * Unlock the buffer partitions in reverse order, to avoid deadlock. Although
 	 * this function is called during shutdown, and one would expect us to be alone,
 	 * but that may not be true, as other user/worker backends may still be alive,
-	 * just as we are. Also, it doensn't hurt to follow the protocol.
+	 * just as we are. Also, it doesn't hurt to follow the protocol.
 	 */
 	for (i = NUM_BUFFER_PARTITIONS; --i >= 0;)
 		LWLockRelease(FirstBufMappingLock + i);
@@ -623,7 +706,8 @@ SaveBuffers(void)
 
 	/*
 	 * Number 0 is reserved; In CreateWorkers(), 0 is used to identify and register
-	 * the BufferSaver.
+	 * the BufferSaver. And number 1 is reserved for save-file that contains global
+	 * objects.
 	 */
 	database_number = 1;
 
@@ -646,13 +730,12 @@ SaveBuffers(void)
 		{
 			/* Special case for global objects */
 
-			/* TODO: getDatabseSaveFileName() call leaks memory */
 			file = AllocateFile(getDatabseSaveFileName(database_number, "global"), PG_BINARY_W);
 
 			if (file == NULL)
 				ereport(ERROR,
-						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("could not create save-file for global objects")));
+						(errcode_for_file_access(),
+						errmsg("could not create save-file for global objects : %m")));
 		}
 		else if (buf->database != prev_database)
 		{
@@ -676,13 +759,12 @@ SaveBuffers(void)
 			Assert(file != NULL);
 			FreeFile(file);
 			file = NULL;
-			/* TODO: getDatabseSaveFileName() call leaks memory */
 			file = AllocateFile(getDatabseSaveFileName(database_number, dbname), PG_BINARY_W);
 
 			if (file == NULL)
 				ereport(ERROR,
-						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("could not create save-file for %s database", dbname)));
+						(errcode_for_file_access(),
+						errmsg("could not create save-file for database \"%s\" : %m", dbname)));
 
 			pfree(dbname);
 
@@ -696,11 +778,7 @@ SaveBuffers(void)
 
 		if (buf->filenode != prev_filenode)
 		{
-			/*
-			 * We're beginning to process a new relation; add a marker for this
-			 * relation.
-			 */
-
+			/* We're beginning to process a new relation; emit a marker for it. */
 			fwrite("r", 1, 1, file);
 			fwrite(&(buf->filenode), sizeof(Oid), 1, file);
 
@@ -713,10 +791,10 @@ SaveBuffers(void)
 
 		if (buf->forknum != prev_forknum)
 		{
-			/* We're beginning to process a new fork of this relation; add a marker
-			 * for this fork.
+			/*
+			 * We're beginning to process a new fork of this relation; add a marker
+			 * for it.
 			 */
-
 			fwrite("f", 1, 1, file);
 			fwrite(&(buf->forknum), sizeof(ForkNumber), 1, file);
 
@@ -777,10 +855,22 @@ SavedBufferCmp(const void *p, const void *q)
 	SavedBuffer *a = (SavedBuffer *) p;
 	SavedBuffer *b = (SavedBuffer *) q;
 
+	/*
+	ereport(LOG,(errmsg("comparing buffers: (%d, %d, %d, %d) : (%d, %d, %d, %d)",
+						a->database, a->filenode, a->forknum, a->blocknum,
+						b->database, b->filenode, b->forknum, b->blocknum)));
+	*/
 	svdbfrcmp(database);
 	svdbfrcmp(filenode);
 	svdbfrcmp(forknum);
 	svdbfrcmp(blocknum);
+
+	/*
+	 * TODO: Ask pgsql-hackers why we get all-zero buffers, even though we're locking
+	 * and inspecting buffer headers for BM_TAG_VALID, and even BM_VALID, flags.
+	 */
+	ereport(LOG,(errmsg("Found two identical buffers: (%d, %d, %d, %d)",
+						a->database, a->filenode, a->forknum, a->blocknum)));
 
 	Assert(false);	// No two buffers should be storing identical page
 
@@ -805,8 +895,11 @@ GetRelOid(Oid filenode)
 	if (ret != SPI_OK_SELECT)
 		elog(FATAL, "SPI_execute failed: error code %d", ret);
 
-	if (SPI_processed != 1)
+	if (SPI_processed > 1)
 		elog(FATAL, "not a singleton result");
+
+	if (SPI_processed < 1)
+		return InvalidOid;
 
 	relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[0],
 									   SPI_tuptable->tupdesc,
