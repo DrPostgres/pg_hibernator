@@ -731,6 +731,19 @@ SaveBuffers(void)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "saving buffers");
 
+#define WRITE_RANGE_RECORD()		\
+	do {							\
+			if (range_counter != 0)	\
+			{						\
+				ereport(LOG,		\
+					(errmsg("DB %d writing range filenode %d forknum %d blocknum %d range %d",				\
+							database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));	\
+																							\
+				fileWrite("N", 1, 1, file, savefile_name);									\
+				fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);	\
+			}																				\
+	} while(0)
+
 	for (i = 0; i < num_buffers; ++i)
 	{
 		SavedBuffer *buf = &saved_buffers[i];
@@ -746,6 +759,7 @@ SaveBuffers(void)
 		{
 			char *dbname;
 
+			WRITE_RANGE_RECORD();
 			/*
 			 * We are beginning to process a different database than the previous one;
 			 * close the save-file of previous database, and open a new one.
@@ -779,6 +793,8 @@ SaveBuffers(void)
 
 		if (buf->filenode != prev_filenode)
 		{
+			WRITE_RANGE_RECORD();
+
 			/* We're beginning to process a new relation; emit a record for it. */
 			fileWrite("r", 1, 1, file, savefile_name);
 			fileWrite(&(buf->filenode), sizeof(Oid), 1, file, savefile_name);
@@ -792,6 +808,8 @@ SaveBuffers(void)
 
 		if (buf->forknum != prev_forknum)
 		{
+			WRITE_RANGE_RECORD();
+
 			/*
 			 * We're beginning to process a new fork of this relation; add a record
 			 * for it.
@@ -813,17 +831,6 @@ SaveBuffers(void)
 		}
 		else
 		{
-#define WRITE_RANGE_RECORD()														\
-			if (range_counter != 0)												\
-			{																	\
-				ereport(LOG,														\
-					(errmsg("DB %d writing range filenode %d forknum %d blocknum %d range %d",				\
-							database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));	\
-																						\
-				fileWrite("N", 1, 1, file, savefile_name);								\
-				fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);	\
-			}
-
 			/*
 			 * We encountered a block that's not in the continuous range of the
 			 * previous block. Emit a record for the previous range, if any, and
