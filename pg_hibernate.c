@@ -478,7 +478,7 @@ ReadBlocks(int number, char *dbname)
 				Assert(rel != NULL);
 				if (rel == NULL)
 					ereport(ERROR,
-							(errmsg("found a fork marker without a preceeding relation marker")));
+							(errmsg("found a fork record without a preceeding relation record")));
 
 				fileRead(&record_forknum, sizeof(ForkNumber), 1, file, false, filename);
 
@@ -496,19 +496,23 @@ ReadBlocks(int number, char *dbname)
 			break;
 			case 'b':
 			{
-				if (skip_relation || skip_fork)
-					continue;
-
 				Assert(rel != NULL);
 				if (rel == NULL)
 					ereport(ERROR,
-							(errmsg("found a block marker without a preceeding relation marker")));
+							(errmsg("found a block record without a preceeding relation record")));
 
 				if (record_forknum == InvalidForkNumber)
 					ereport(ERROR,
-							(errmsg("found a block marker without a preceeding fork marker")));
+							(errmsg("found a block record without a preceeding fork record")));
 
 				fileRead(&record_blocknum, sizeof(BlockNumber), 1, file, false, filename);
+
+				ereport(LOG,
+						(errmsg("DB %d reading block filenode %d forknum %d blocknum %d",
+								number, record_filenode, record_forknum, record_blocknum)));
+
+				if (skip_relation || skip_fork)
+					continue;
 
 				ereport(log_level, (errmsg("processing block %d", record_blocknum)));
 
@@ -518,6 +522,10 @@ ReadBlocks(int number, char *dbname)
 				 */
 				if (record_blocknum >= nblocks)
 				{
+					ereport(log_level,
+							(errmsg("skipping filenode %d forknum %d blocknum %d",
+									record_filenode, record_forknum, record_blocknum)));
+
 					skip_block = true;
 					continue;
 				}
@@ -536,29 +544,38 @@ ReadBlocks(int number, char *dbname)
 			{
 				int64 block;
 
-				if (skip_relation || skip_fork || skip_block)
-					continue;
-
 				Assert(record_blocknum != InvalidBlockNumber);
 				if (rel == NULL)
 					ereport(ERROR,
-							(errmsg("found a block range marker without a preceeding relation marker")));
+							(errmsg("found a block range record without a preceeding relation record")));
 
 				if (record_forknum == InvalidForkNumber)
 					ereport(ERROR,
-							(errmsg("found a block range marker without a preceeding fork marker")));
+							(errmsg("found a block range record without a preceeding fork record")));
 
 				if (record_blocknum == InvalidBlockNumber)
 					ereport(ERROR,
-							(errmsg("found a block range marker without a preceeding block marker")));
+							(errmsg("found a block range record without a preceeding block record")));
 
 				fileRead(&record_range, sizeof(int), 1, file, false, filename);
 
-				ereport(log_level, (errmsg("processing range %d", record_range)));
+				ereport(LOG,
+						(errmsg("DB %d reading range filenode %d forknum %d blocknum %d range %d",
+								number, record_filenode, record_forknum, record_blocknum, record_range)));
 
-				for (block = record_blocknum + 1; block < (record_blocknum + record_range); ++block)
+				if (skip_relation || skip_fork || skip_block)
+					continue;
+
+				for (block = record_blocknum + 1; block <= (record_blocknum + record_range); ++block)
 				{
 					Buffer	buf;
+
+					/*
+					* Don't try to read past the file; the file may have been shrunk
+					* by a vaccum operation.
+					*/
+					if (block >= nblocks)
+						break;
 
 					buf = ReadBufferExtended(rel, record_forknum, block, RBM_NORMAL, NULL);
 					ReleaseBuffer(buf);
@@ -714,6 +731,19 @@ SaveBuffers(void)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "saving buffers");
 
+#define WRITE_RANGE_RECORD()		\
+	do {							\
+			if (range_counter != 0)	\
+			{						\
+				ereport(LOG,		\
+					(errmsg("DB %d writing range filenode %d forknum %d blocknum %d range %d",				\
+							database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));	\
+																							\
+				fileWrite("N", 1, 1, file, savefile_name);									\
+				fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);	\
+			}																				\
+	} while(0)
+
 	for (i = 0; i < num_buffers; ++i)
 	{
 		SavedBuffer *buf = &saved_buffers[i];
@@ -729,6 +759,7 @@ SaveBuffers(void)
 		{
 			char *dbname;
 
+			WRITE_RANGE_RECORD();
 			/*
 			 * We are beginning to process a different database than the previous one;
 			 * close the save-file of previous database, and open a new one.
@@ -762,7 +793,9 @@ SaveBuffers(void)
 
 		if (buf->filenode != prev_filenode)
 		{
-			/* We're beginning to process a new relation; emit a marker for it. */
+			WRITE_RANGE_RECORD();
+
+			/* We're beginning to process a new relation; emit a record for it. */
 			fileWrite("r", 1, 1, file, savefile_name);
 			fileWrite(&(buf->filenode), sizeof(Oid), 1, file, savefile_name);
 
@@ -775,8 +808,10 @@ SaveBuffers(void)
 
 		if (buf->forknum != prev_forknum)
 		{
+			WRITE_RANGE_RECORD();
+
 			/*
-			 * We're beginning to process a new fork of this relation; add a marker
+			 * We're beginning to process a new fork of this relation; add a record
 			 * for it.
 			 */
 			fileWrite("f", 1, 1, file, savefile_name);
@@ -798,14 +833,14 @@ SaveBuffers(void)
 		{
 			/*
 			 * We encountered a block that's not in the continuous range of the
-			 * previous block. Emit a marker for the previous range, if any, and
-			 * then emit a marker for this block.
+			 * previous block. Emit a record for the previous range, if any, and
+			 * then emit a record for this block.
 			 */
-			if (range_counter != 0)
-			{
-				fileWrite("N", 1, 1, file, savefile_name);
-				fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);
-			}
+			WRITE_RANGE_RECORD();
+			
+			ereport(LOG,
+					(errmsg("DB %d writing block filenode %d forknum %d blocknum %d",
+							database_number, prev_filenode, prev_forknum, buf->blocknum)));
 
 			fileWrite("b", 1, 1, file, savefile_name);
 			fileWrite(&(buf->blocknum), sizeof(BlockNumber), 1, file, savefile_name);
@@ -815,6 +850,12 @@ SaveBuffers(void)
 			range_counter	= 0;
 		}
 	}
+
+	/*
+	 * We might have exited the above loop while we were still in the middle of
+	 * processing a continuous range of blocks. Emit that record now.
+	 */
+	WRITE_RANGE_RECORD();
 
 	Assert(file != NULL);
 	fileClose(file, savefile_name);
