@@ -392,6 +392,7 @@ ReadBlocks(int number, char *dbname)
 	bool		skip_block = false;
 	int64		nblocks = 0;
 	const char *filename;
+	int			blocks_restored;
 
 	filename = getDatabaseSaveFileName(number, dbname);
 	file = fileOpen(filename, PG_BINARY_R);
@@ -405,6 +406,7 @@ ReadBlocks(int number, char *dbname)
 	pgstat_report_activity(STATE_RUNNING, "restoring buffers");
 
 	rel = NULL;
+	blocks_restored = 0;
 
 	/*
 	 * Note that in case of a read error, we will leak relcache entry that we may
@@ -497,9 +499,6 @@ ReadBlocks(int number, char *dbname)
 			case 'b':
 			{
 				Assert(rel != NULL);
-				if (rel == NULL)
-					ereport(ERROR,
-							(errmsg("found a block record without a preceeding relation record")));
 
 				if (record_forknum == InvalidForkNumber)
 					ereport(ERROR,
@@ -537,6 +536,8 @@ ReadBlocks(int number, char *dbname)
 
 					buf = ReadBufferExtended(rel, record_forknum, record_blocknum, RBM_NORMAL, NULL);
 					ReleaseBuffer(buf);
+
+					++blocks_restored;
 				}
 			}
 			break;
@@ -545,13 +546,6 @@ ReadBlocks(int number, char *dbname)
 				int64 block;
 
 				Assert(record_blocknum != InvalidBlockNumber);
-				if (rel == NULL)
-					ereport(ERROR,
-							(errmsg("found a block range record without a preceeding relation record")));
-
-				if (record_forknum == InvalidForkNumber)
-					ereport(ERROR,
-							(errmsg("found a block range record without a preceeding fork record")));
 
 				if (record_blocknum == InvalidBlockNumber)
 					ereport(ERROR,
@@ -579,6 +573,8 @@ ReadBlocks(int number, char *dbname)
 
 					buf = ReadBufferExtended(rel, record_forknum, block, RBM_NORMAL, NULL);
 					ReleaseBuffer(buf);
+
+					++blocks_restored;
 				}
 			}
 			break;
@@ -594,6 +590,10 @@ ReadBlocks(int number, char *dbname)
 
 	if (rel)
 		relation_close(rel, AccessShareLock);
+
+	ereport(LOG,
+			(errmsg("Hibernate Block Reader %d: restored %d blocks",
+					number, blocks_restored)));
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -748,14 +748,17 @@ SaveBuffers(void)
 	{
 		SavedBuffer *buf = &saved_buffers[i];
 
-		if (buf->database == 0)
+		if (i == 0)
 		{
 			/* Special case for global objects */
+
+			Assert(buf->database == 0);
 
 			savefile_name = getDatabaseSaveFileName(database_number, "global");
 			file = fileOpen(savefile_name, PG_BINARY_W);
 		}
-		else if (buf->database != prev_database)
+
+		if (buf->database != prev_database)
 		{
 			char *dbname;
 
@@ -856,6 +859,10 @@ SaveBuffers(void)
 	 * processing a continuous range of blocks. Emit that record now.
 	 */
 	WRITE_RANGE_RECORD();
+
+	ereport(LOG,
+			(errmsg("Hibernate Buffer Saver: saved metadata of %d blocks",
+					num_buffers)));
 
 	Assert(file != NULL);
 	fileClose(file, savefile_name);
