@@ -15,6 +15,7 @@
 
 /* Header files needed by this plugin */
 #include "access/xact.h"
+#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -904,23 +905,30 @@ SavedBufferCmp(const void *p, const void *q)
 static Oid
 GetRelOid(Oid filenode)
 {
-	StringInfoData buf;
 	int			ret;
 	Oid			relid;
 	bool		isnull;
+	static SPIPlanPtr	plan = NULL;
+	Datum	value[1] = {ObjectIdGetDatum(filenode)};
 
+	if (plan == NULL)
+	{
+		StringInfoData	buf;
+		Oid	paramType[1] = {OIDOID};
 
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "select oid from pg_class where pg_relation_filenode(oid) = %d",
-					 filenode);
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "select oid from pg_class where pg_relation_filenode(oid) = $1");
 
-	/* TODO: Use SPI_prepare() to prepare a plan, preserved across calls. */
-	ret = SPI_execute(buf.data, true, 0);
+		plan = SPI_prepare(buf.data, 1, (Oid*)&paramType);
+
+		if (plan == NULL)
+			elog(ERROR, "SPI_prepare returned %d", SPI_result);
+	}
+
+	ret = SPI_execute_plan(plan, (Datum*)&value, NULL, true, 1);
+
 	if (ret != SPI_OK_SELECT)
-		elog(FATAL, "SPI_execute failed: error code %d", ret);
-
-	if (SPI_processed > 1)
-		elog(FATAL, "not a singleton result");
+		ereport(FATAL, (errmsg("SPI_execute_plan failed: error code %d", ret)));
 
 	if (SPI_processed < 1)
 		return InvalidOid;
