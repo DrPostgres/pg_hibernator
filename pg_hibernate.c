@@ -13,7 +13,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 
-/* Header files needed by this plugin */
+/* Header files needed by this extension */
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
@@ -35,10 +35,10 @@ PG_MODULE_MAGIC;
 typedef struct SavedBuffer
 {
 	Oid			database;
-	Oid			filenode;	/* Stream marker: 'r' */
-	ForkNumber	forknum;	/* Stream marker: 'f' */
-	BlockNumber	blocknum;	/* Stream marker: 'b' */
-							/* Stream marker: 'N' for range of blocks */
+	Oid			filenode;	/* On-disk marker: 'r', for Relfilenode */
+	ForkNumber	forknum;	/* On-disk marker: 'f' */
+	BlockNumber	blocknum;	/* On-disk marker: 'b' */
+							/* On-disk marker: 'N', for range of N blocks */
 } SavedBuffer;
 
 /* Forward declarations */
@@ -54,7 +54,7 @@ static void		CreateWorkers(void);
 static void		CreateWorker(int id);
 
 static void		BlockReaderMain(Datum main_arg);
-static void		ReadBlocks(int number, char *dbname);
+static void		ReadBlocks(int filenum, char *dbname);
 
 static void		BufferSaverMain(Datum main_arg);
 static void		SaveBuffers(void);
@@ -62,16 +62,16 @@ static void		SaveBuffers(void);
 /* Secondary/supporting functions */
 static void		sigtermHandler(SIGNAL_ARGS);
 static void		sighupHandler(SIGNAL_ARGS);
-static const char* getSaveDirName();
-static const char* getDatabaseSaveFileName(int number, const char* const dbname);
+
 static void		WorkerCommon(void);
 static int		SavedBufferCmp(const void *a, const void *b);
 static Oid		GetRelOid(Oid filenode);
-static bool		parseSaveFileName(const char *fname, int * number, char *dbname);
+static bool		parseSavefileName(const char *fname, int *filenum, char *dbname);
 static FILE*	fileOpen(const char *path, const char *mode);
 static bool		fileClose(FILE *file, const char *path);
 static bool		fileRead(void *dest, size_t size, size_t n, FILE *file, bool eof_ok, const char *path);
 static bool		fileWrite(const void *src, size_t size, size_t n, FILE *file, const char *path);
+static const char* getDatabaseSavefileName(int filenum, const char* const dbname);
 
 /*
  * TODO: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
@@ -139,9 +139,9 @@ DefineGUCs(void)
 							NULL,
 							NULL);
 
-	DefineCustomStringVariable("hibernate.default_db",
-							"Default database to connect to.",
-							NULL,
+	DefineCustomStringVariable("hibernate.default_database",
+							"Database to connect to, by default.",
+							"pg_hibernate will connect to this database when saving buffers, and when reading blocks of global objects.",
 							&default_database,
 							default_database,
 							PGC_POSTMASTER,
@@ -151,53 +151,11 @@ DefineGUCs(void)
 							NULL);
 }
 
-/* We use static arrays in these functions, because the returned pointers */
-static const char*
-getSaveDirName()
-{
-	static char	hibernate_dir[sizeof(SAVE_LOCATION) + 1];
-
-	if (hibernate_dir[0] == '\0')
-		snprintf(hibernate_dir, sizeof(hibernate_dir), "%s", SAVE_LOCATION);
-
-	return hibernate_dir;
-}
-
-static const char*
-getDatabaseSaveFileName(int number, const char *dbname)
-{
-	static char ret[MAXPGPATH];
-
-	snprintf(ret, sizeof(ret), "%s/%d.%s.save", getSaveDirName(), number, dbname);
-
-	return ret;
-}
-
-static bool
-parseSaveFileName(const char *fname, int *number, char *dbname)
-{
-	int dbname_len;
-
-	/* The save-file names are supposed to be in the format <integer>.<dbname>.save */
-
-	if (sscanf(fname, "%d.%s", number, dbname) != 2)
-		return false;	/* Fail if the name doesn't match the format we're expecting */
-
-	dbname_len = strlen(dbname);
-
-	if (strcmp(&dbname[dbname_len - 5], ".save") != 0)
-		return false;	/* Fail if the name doesn't match the format we're expecting */
-
-	dbname[dbname_len - 5] = '\0';
-
-	return true;
-}
-
 static void
 CreateDirectory(void)
 {
 	struct stat		st;
-	const char	   *hibernate_dir = getSaveDirName();
+	const char	   *hibernate_dir = SAVE_LOCATION;
 
 	if (stat(hibernate_dir, &st) == 0)
 	{
@@ -246,7 +204,7 @@ CreateWorkers(void)
 	if (!hibernate_enabled)
 		return;
 
-	hibernate_dir = getSaveDirName();
+	hibernate_dir = SAVE_LOCATION;
 
 	dir = opendir(hibernate_dir);
 	if (dir == NULL)
@@ -257,19 +215,19 @@ CreateWorkers(void)
 	errno = 0;
 	while ((dent = readdir(dir)) != NULL)
 	{
-		int		number;
+		int		filenum;
 		char	dbname[NAMEDATALEN];
 
-		if (!parseSaveFileName(dent->d_name, &number, dbname))
+		if (!parseSavefileName(dent->d_name, &filenum, dbname))
 			continue;
 
-		CreateWorker(number);
+		CreateWorker(filenum);
 	}
 
 	if (errno != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				errmsg("encountered error during readdir \"%s\": %m", hibernate_dir)));
+				errmsg("error encountered during readdir \"%s\": %m", hibernate_dir)));
 
 	closedir(dir);
 }
@@ -285,7 +243,7 @@ CreateWorker(int id)
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= 0;	/* Keep the BufferSaver running */
 		worker.bgw_main			= BufferSaverMain;
-		snprintf(worker.bgw_name, BGW_MAXLEN, "Hibernate Buffer Saver");
+		snprintf(worker.bgw_name, BGW_MAXLEN, "Buffer Saver");
 	}
 	else
 	{
@@ -293,7 +251,7 @@ CreateWorker(int id)
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= BGW_NEVER_RESTART;	/* Don't restart BlockReaders upon error */
 		worker.bgw_main			= BlockReaderMain;
-		snprintf(worker.bgw_name, BGW_MAXLEN, "Hibernate Block Reader %d", id);
+		snprintf(worker.bgw_name, BGW_MAXLEN, "Block Reader %d", id);
 	}
 
 	worker.bgw_main_arg = Int32GetDatum(id);
@@ -315,11 +273,11 @@ WorkerCommon(void)
 static void
 BlockReaderMain(Datum main_arg)
 {
-	int					index = DatumGetInt32(main_arg);
+	int					id = DatumGetInt32(main_arg);
 	DIR				   *dir;
-	const char		   *hibernate_dir = getSaveDirName();
+	const char		   *hibernate_dir = SAVE_LOCATION;
 	struct dirent	   *dent;
-	int					number;
+	int					filenum;
 	char				dbname[NAMEDATALEN];
 
 	WorkerCommon();
@@ -328,16 +286,16 @@ BlockReaderMain(Datum main_arg)
 	if (dir == NULL)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("Hibernate Block Reader %d: could not open directory \"%s\": %m",
-						index, hibernate_dir)));
+				 errmsg("Block Reader %d: could not open directory \"%s\": %m",
+						id, hibernate_dir)));
 
 	errno = 0;
 	while ((dent = readdir(dir)) != NULL)
 	{
-		if (!parseSaveFileName(dent->d_name, &number, dbname))
+		if (!parseSavefileName(dent->d_name, &filenum, dbname))
 			continue;
 
-		if (number == index)
+		if (filenum == id)
 			break;
 	}
 
@@ -348,16 +306,16 @@ BlockReaderMain(Datum main_arg)
 		if (errno != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					errmsg("Hibernate Block Reader %d: encountered error during readdir \"%s\": %m",
-							index, hibernate_dir)));
+					errmsg("Block Reader %d: encountered error during readdir \"%s\": %m",
+							filenum, hibernate_dir)));
 
 		ereport(ERROR,
-				(errmsg("Hibernate Block Reader %d: could not find its save-file", index)));
+				(errmsg("Block Reader %d: could not find its save-file", filenum)));
 	}
 	closedir(dir);
 
 	/* We found the file we're supposed to restore. */
-	ReadBlocks(number, dbname);
+	ReadBlocks(filenum, dbname);
 
 	/*
 	 * Exit with non-zero status to ensure that this worker is not restarted.
@@ -371,43 +329,47 @@ BlockReaderMain(Datum main_arg)
 	 * this message should console the user that everything went okay, even though
 	 * the exit code is 1.
 	 */
-	ereport(LOG, (errmsg("Hibernate Block Reader %d: all blocks read successfully", index)));
+	ereport(LOG, (errmsg("Block Reader %d: all blocks read successfully", filenum)));
 	proc_exit(1);
 }
 
 static void
-ReadBlocks(int number, char *dbname)
+ReadBlocks(int filenum, char *dbname)
 {
 	FILE	   *file;
 	char		record_type;
 	Oid			record_filenode;
 	ForkNumber	record_forknum;
 	BlockNumber	record_blocknum;
-	int			record_range;
+	BlockNumber	record_range;
 
-	int			log_level = DEBUG3;
-	Oid			relOid;
-	Relation	rel;
-	bool		skip_relation = false;
-	bool		skip_fork = false;
-	bool		skip_block = false;
-	int64		nblocks = 0;
+	int			log_level		= DEBUG3;
+	Oid			relOid			= InvalidOid;
+	Relation	rel				= NULL;
+	bool		skip_relation	= false;
+	bool		skip_fork		= false;
+	bool		skip_block		= false;
+	BlockNumber	nblocks			= 0;
+	BlockNumber	blocks_restored	= 0;
 	const char *filename;
-	int			blocks_restored;
 
-	filename = getDatabaseSaveFileName(number, dbname);
+	/*
+	 * If this condition changes, then this code, and the code in the writer
+	 * will need to be changed; especially the format specifiers in log and
+	 * error messages.
+	 */
+	StaticAssertStmt(MaxBlockNumber == 0xFFFFFFFE, "Code may need review.");
+
+	filename = getDatabaseSavefileName(filenum, dbname);
 	file = fileOpen(filename, PG_BINARY_R);
 
 	/* To restore the global objects, use default database */
-	BackgroundWorkerInitializeConnection(number == 1 ? default_database : dbname, NULL);
+	BackgroundWorkerInitializeConnection(filenum == 1 ? default_database : dbname, NULL);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "restoring buffers");
-
-	rel = NULL;
-	blocks_restored = 0;
 
 	/*
 	 * Note that in case of a read error, we will leak relcache entry that we may
@@ -415,17 +377,18 @@ ReadBlocks(int number, char *dbname)
 	 */
 	while (fileRead(&record_type, 1, 1, file, true, filename))
 	{
-		/* If we want to process the signals, this seems to be the best place to do
-		 * it. Generally the backends refrain from processing config file while in
-		 * transaction, but that's more for the fear of allowing GUC changes to
-		 * affect expression evaluation, causing different results in the same
-		 * transaction. Since this worker is not processing any queries, it is okay
-		 * to process the config file here.
+		/*
+		 * If we want to process the signals, this seems to be the best place
+		 * to do it. Generally the backends refrain from processing config file
+		 * while in transaction, but that's more for the fear of allowing GUC
+		 * changes to affect expression evaluation, causing different results
+		 * for the same expression in a transaction. Since this worker is not
+		 * processing any queries, it is okay to process the config file here.
 		 *
-		 * Even though it's okay to process SIGHUP here, doing so doesn't add any
-		 * value. The only reason we might want to process config file here would
-		 * be to allow the user to interrupt the BlockReader's operation by
-		 * changing this extenstion's GUC parameter. But the user can do that
+		 * Even though it's okay to process SIGHUP here, doing so doesn't add
+		 * any value. The only reason we might want to process config file here
+		 * would be to allow the user to interrupt the BlockReader's operation
+		 * by changing this extenstion's GUC parameter. But the user can do that
 		 * anyway, using SIGTERM or pg_terminate_backend().
 		 */
 
@@ -452,7 +415,7 @@ ReadBlocks(int number, char *dbname)
 
 				relOid = GetRelOid(record_filenode);
 
-				ereport(log_level, (errmsg("processing filenode %d, relation %d",
+				ereport(log_level, (errmsg("processing filenode %u, relation %u",
 										record_filenode, relOid)));
 				/*
 				 * If the relation has been rewritten/dropped since we saved it,
@@ -507,14 +470,8 @@ ReadBlocks(int number, char *dbname)
 
 				fileRead(&record_blocknum, sizeof(BlockNumber), 1, file, false, filename);
 
-				ereport(LOG,
-						(errmsg("DB %d reading block filenode %d forknum %d blocknum %d",
-								number, record_filenode, record_forknum, record_blocknum)));
-
 				if (skip_relation || skip_fork)
 					continue;
-
-				ereport(log_level, (errmsg("processing block %d", record_blocknum)));
 
 				/*
 				 * Don't try to read past the file; the file may have been shrunk
@@ -523,8 +480,8 @@ ReadBlocks(int number, char *dbname)
 				if (record_blocknum >= nblocks)
 				{
 					ereport(log_level,
-							(errmsg("skipping filenode %d forknum %d blocknum %d",
-									record_filenode, record_forknum, record_blocknum)));
+							(errmsg("reader %d skipping block filenode %u forknum %d blocknum %u",
+									filenum, record_filenode, record_forknum, record_blocknum)));
 
 					skip_block = true;
 					continue;
@@ -535,6 +492,10 @@ ReadBlocks(int number, char *dbname)
 
 					skip_block = false;
 
+					ereport(log_level,
+							(errmsg("reader %d reading block filenode %u forknum %d blocknum %u",
+									filenum, record_filenode, record_forknum, record_blocknum)));
+
 					buf = ReadBufferExtended(rel, record_forknum, record_blocknum, RBM_NORMAL, NULL);
 					ReleaseBuffer(buf);
 
@@ -544,7 +505,7 @@ ReadBlocks(int number, char *dbname)
 			break;
 			case 'N':
 			{
-				int64 block;
+				BlockNumber block;
 
 				Assert(record_blocknum != InvalidBlockNumber);
 
@@ -554,10 +515,6 @@ ReadBlocks(int number, char *dbname)
 
 				fileRead(&record_range, sizeof(int), 1, file, false, filename);
 
-				ereport(LOG,
-						(errmsg("DB %d reading range filenode %d forknum %d blocknum %d range %d",
-								number, record_filenode, record_forknum, record_blocknum, record_range)));
-
 				if (skip_relation || skip_fork || skip_block)
 					continue;
 
@@ -566,11 +523,22 @@ ReadBlocks(int number, char *dbname)
 					Buffer	buf;
 
 					/*
-					* Don't try to read past the file; the file may have been shrunk
-					* by a vaccum operation.
+					* Don't try to read past the file; the file may have been
+					* shrunk by a vaccum operation.
 					*/
 					if (block >= nblocks)
+					{
+						ereport(log_level,
+								(errmsg("reader %d skipping block range filenode %u forknum %d start %u end %u",
+										filenum, record_filenode, record_forknum,
+										block, record_blocknum + record_range)));
+
 						break;
+					}
+
+					ereport(log_level,
+							(errmsg("reader %d reading range filenode %u forknum %d blocknum %u range %u",
+									filenum, record_filenode, record_forknum, record_blocknum, record_range)));
 
 					buf = ReadBufferExtended(rel, record_forknum, block, RBM_NORMAL, NULL);
 					ReleaseBuffer(buf);
@@ -593,8 +561,8 @@ ReadBlocks(int number, char *dbname)
 		relation_close(rel, AccessShareLock);
 
 	ereport(LOG,
-			(errmsg("Hibernate Block Reader %d: restored %d blocks",
-					number, blocks_restored)));
+			(errmsg("Block Reader %d: restored %u blocks",
+					filenum, blocks_restored)));
 
 	SPI_finish();
 	PopActiveSnapshot();
@@ -646,13 +614,19 @@ BufferSaverMain(Datum main_arg)
 		}
 	}
 
-	/* We recieved the SIGTERM, so save the shared-buffer contents */
+	/*
+	 * We recieved the SIGTERM; Shutdown is in progress, so save the
+	 * shared-buffer contents.
+	 */
 
 	/* Save the buffers only if the extension is enabled. */
 	if (hibernate_enabled)
 		SaveBuffers();
 
-	/* The worker exits here. A proc_exit(0) is not necessary, let the caller do that. */
+	/*
+	 * The worker exits here. A proc_exit(0) is not necessary, we'll let the
+	 * caller do that.
+	 */
 }
 
 static void
@@ -660,6 +634,7 @@ SaveBuffers(void)
 {
 	int						i;
 	int						num_buffers;
+	int						log_level		= DEBUG3;
 	SavedBuffer			   *saved_buffers;
 	volatile BufferDesc	   *bufHdr;			// XXX: Do we really need volatile here?
 	FILE				   *file			= NULL;
@@ -668,12 +643,16 @@ SaveBuffers(void)
 	Oid						prev_filenode	= InvalidOid;
 	ForkNumber				prev_forknum	= InvalidForkNumber;
 	BlockNumber				prev_blocknum	= InvalidBlockNumber;
-	uint					range_counter	= 0;
+	BlockNumber				range_counter	= 0;
 	const char			   *savefile_name;
 
 	/*
-	 * TODO: If the memory request fails, ask for a smaller memory chunk, and use it
-	 * to create chunks of save-files, and make the workers read those chunks.
+	 * XXX: If the memory request fails, ask for a smaller memory chunk, and use
+	 * it to create chunks of save-files, and make the workers read those chunks.
+	 *
+	 * This is not a concern as of now, so deferred; there's at least one other
+	 * place that allocates (NBuffers * (much_bigger_struct)), so this seems to
+	 * be common practice.
 	 */
 
 	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
@@ -722,9 +701,7 @@ SaveBuffers(void)
 	database_number = 1;
 
 	/*
-	 * TODO: Figure out why we need a default DB here. The autovacuum-launcher
-	 * seems to do fine without it! See InitPostgres(NULL, InvalidOid, NULL, NULL)
-	 * call in autovacuum.c
+	 * Connect to the database and start a transaction for database name lookups.
 	 */
 	BackgroundWorkerInitializeConnection(default_database, NULL);
 	SetCurrentStatementStartTimestamp();
@@ -736,8 +713,8 @@ SaveBuffers(void)
 	do {							\
 			if (range_counter != 0)	\
 			{						\
-				ereport(LOG,		\
-					(errmsg("DB %d writing range filenode %d forknum %d blocknum %d range %d",				\
+				ereport(log_level,	\
+					(errmsg("writer: writing range db %d filenode %d forknum %d blocknum %d range %d",		\
 							database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));	\
 																							\
 				fileWrite("N", 1, 1, file, savefile_name);									\
@@ -749,13 +726,14 @@ SaveBuffers(void)
 	{
 		SavedBuffer *buf = &saved_buffers[i];
 
-		if (i == 0)
+		if (i == 0 && buf->database == 0)
 		{
-			/* Special case for global objects */
+			/*
+			 * Special case for global objects, if any. The qsort would've
+			 * brought then to the front of the list.
+			 */
 
-			Assert(buf->database == 0);
-
-			savefile_name = getDatabaseSaveFileName(database_number, "global");
+			savefile_name = getDatabaseSavefileName(database_number, "global");
 			file = fileOpen(savefile_name, PG_BINARY_W);
 		}
 
@@ -764,6 +742,7 @@ SaveBuffers(void)
 			char *dbname;
 
 			WRITE_RANGE_RECORD();
+
 			/*
 			 * We are beginning to process a different database than the previous one;
 			 * close the save-file of previous database, and open a new one.
@@ -774,15 +753,10 @@ SaveBuffers(void)
 
 			Assert(dbname != NULL);
 
-			/*
-			 * Ensure that this is not the first database we process. This assertion
-			 * is not really necessary, but it cements our assumption that the qsort
-			 * above brings the global objects to the front.
-			 */
-			Assert(file != NULL);
-			fileClose(file, savefile_name);
+			if (file != NULL)
+				fileClose(file, savefile_name);
 
-			savefile_name = getDatabaseSaveFileName(database_number, dbname);
+			savefile_name = getDatabaseSavefileName(database_number, dbname);
 			file = fileOpen(savefile_name, PG_BINARY_W);
 
 			pfree(dbname);
@@ -842,8 +816,8 @@ SaveBuffers(void)
 			 */
 			WRITE_RANGE_RECORD();
 			
-			ereport(LOG,
-					(errmsg("DB %d writing block filenode %d forknum %d blocknum %d",
+			ereport(log_level,
+					(errmsg("writer: writing block db %d filenode %d forknum %d blocknum %d",
 							database_number, prev_filenode, prev_forknum, buf->blocknum)));
 
 			fileWrite("b", 1, 1, file, savefile_name);
@@ -862,7 +836,7 @@ SaveBuffers(void)
 	WRITE_RANGE_RECORD();
 
 	ereport(LOG,
-			(errmsg("Hibernate Buffer Saver: saved metadata of %d blocks",
+			(errmsg("Buffer Saver: saved metadata of %d blocks",
 					num_buffers)));
 
 	Assert(file != NULL);
@@ -887,11 +861,6 @@ SavedBufferCmp(const void *p, const void *q)
 	SavedBuffer *a = (SavedBuffer *) p;
 	SavedBuffer *b = (SavedBuffer *) q;
 
-	/*
-	ereport(LOG,(errmsg("comparing buffers: (%d, %d, %d, %d) : (%d, %d, %d, %d)",
-						a->database, a->filenode, a->forknum, a->blocknum,
-						b->database, b->filenode, b->forknum, b->blocknum)));
-	*/
 	svdbfrcmp(database);
 	svdbfrcmp(filenode);
 	svdbfrcmp(forknum);
@@ -908,9 +877,11 @@ GetRelOid(Oid filenode)
 	int			ret;
 	Oid			relid;
 	bool		isnull;
-	static SPIPlanPtr	plan = NULL;
-	Datum	value[1] = {ObjectIdGetDatum(filenode)};
+	Datum		value[1] = { ObjectIdGetDatum(filenode) };
 
+	static SPIPlanPtr	plan = NULL;
+
+	/* If this is our first time here, create a plan and save it for later calls. */
 	if (plan == NULL)
 	{
 		StringInfoData	buf;
@@ -998,11 +969,44 @@ static bool
 fileWrite(const void *src, size_t size, size_t n, FILE *file, const char *path)
 {
 	if (fwrite(src, size, n, file) != n)
-	{
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				errmsg("error writing to \"%s\" : %m", path)));
-	}
 
 	return true;
 }
+
+/*
+ * We use static array here, because the returned pointer is not modified by
+ * the callers, and they call this function everytime they need new value.
+ */
+static const char*
+getDatabaseSavefileName(int filenum, const char *dbname)
+{
+	static char ret[MAXPGPATH];
+
+	snprintf(ret, sizeof(ret), "%s/%d.%s.save", SAVE_LOCATION, filenum, dbname);
+
+	return ret;
+}
+
+static bool
+parseSavefileName(const char *fname, int *filenum, char *dbname)
+{
+	int dbname_len;
+
+	/* The save-file names are supposed to be in the format <integer>.<dbname>.save */
+
+	if (sscanf(fname, "%d.%s", filenum, dbname) != 2)
+		return false;	/* Fail if the name doesn't match the format we're expecting */
+
+	dbname_len = strlen(dbname);
+
+	if (strcmp(&dbname[dbname_len - 5], ".save") != 0)
+		return false;	/* Fail if the name doesn't match the format we're expecting */
+
+	dbname[dbname_len - 5] = '\0';
+
+	return true;
+}
+
