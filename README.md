@@ -21,11 +21,12 @@ shutdown.
 The duration for which the server is building up caches, and trying to reach its
 optimal cache performance is called ramp-up time.
 
-This Postgres extension is aimed at reducing the ramp-up time.
+This extension is aimed at reducing the ramp-up time of Postgres servers.
 
 ## How
 
-Compile and install the extension:
+Compile and install the extension (of course, you'd need Postgres installation or
+source code):
 
     $ make -C pg_hibernate/ install
 
@@ -39,21 +40,23 @@ Then.
 
 This extension uses the `Background Worker` infrastructure of Postgres, which was
 introduced in Postgres 9.3. When the server starts, this extension registers
-background workers; one (called `Buffer Saver`) for saving the buffers when the
+background workers; one for saving the buffers (called `Buffer Saver`) when the
 server shuts down, and one for each database in the cluster (called `Block Readers`)
 for restoring the buffers saved during previous shutdown.
 
 When the Postgres server is being stopped/shut down, the `Buffer Saver` scans the
 shared-buffers of Postgres, and stores the unique block identifiers of each cached
-block to the disk. This information is saved under the `$PGDATA/pg_hibernate/`
-directory. For each of the database whose blocks are resident in shared buffers,
-one file is created; for eg.: `$PGDATA/pg_hibernate/2.postgres.save`.
+block to the disk (with some optimizatins). This information is saved under the
+`$PGDATA/pg_hibernate/` directory. For each of the database whose blocks are
+resident in shared buffers, one file is created; for eg.:
+`$PGDATA/pg_hibernate/2.postgres.save`.
 
 During the next startup sequence, the `Block Reader` threads are registerd, one for
 each file present under `$PGDATA/pg_hibernate/` directory. When the Postgres server
-has reached stable state (that is, it's ready for database connections), these `Block Reader` processes are launched. The `Block Reader` process reads the save-files looking
-for block-ids to restore, connects to the respective database, and requests Postgres
-to fetch the blocks into shared-buffers.
+has reached stable state (that is, it's ready for database connections), these
+`Block Reader` processes are launched. The `Block Reader` process reads the save-files
+looking for block-ids to restore. It then connects to the respective database,
+and requests Postgres to fetch the blocks into shared-buffers.
 
 ## Caveats
 - It saves the buffer information only when Postgres server is shutdown in normal mode.
