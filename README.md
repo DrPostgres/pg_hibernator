@@ -28,7 +28,7 @@ This extension is aimed at reducing the ramp-up time of Postgres servers.
 Compile and install the extension (of course, you'd need Postgres installation or
 source code):
 
-    $ make -C pg_hibernate/ install
+    $ make install
 
 Then.
 
