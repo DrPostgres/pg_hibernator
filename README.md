@@ -25,10 +25,20 @@ This extension is aimed at reducing the ramp-up time of Postgres servers.
 
 ## How
 
-Compile and install the extension (of course, you'd need Postgres installation or
-source code):
+Get the source code of this extension.
 
-    $ make -C pg_hibernator/ install
+    $ wget -O pg_hibernator.zip https://github.com/gurjeet/pg_hibernator/archive/master.zip
+    $ unzip -j -d pg_hibernator pg_hibernator.zip
+
+or
+
+    $ git clone https://github.com/gurjeet/pg_hibernator.git
+
+Compile and install the extension (you'll need a Postgres instalation and its
+`pg_config` in `$PATH`):
+
+    $ cd pg_hibernator
+    $ make install
 
 Then.
 
@@ -46,7 +56,7 @@ for restoring the buffers saved during previous shutdown.
 
 When the Postgres server is being stopped/shut down, the `Buffer Saver` scans the
 shared-buffers of Postgres, and stores the unique block identifiers of each cached
-block to the disk (with some optimizatins). This information is saved under the
+block to the disk (with some optimizations). This information is saved under the
 `$PGDATA/pg_hibernator/` directory. For each of the database whose blocks are
 resident in shared buffers, one file is created; for eg.:
 `$PGDATA/pg_hibernator/2.postgres.save`.
