@@ -43,7 +43,7 @@ typedef struct SavedBuffer
 
 /* Forward declarations */
 
-#define SAVE_LOCATION "pg_hibernate"
+#define SAVE_LOCATION "pg_hibernator"
 
 /* Primary functions */
 void			_PG_init(void);
@@ -128,7 +128,7 @@ static void
 DefineGUCs(void)
 {
 	/* get the configuration */
-	DefineCustomBoolVariable("hibernate.enable",
+	DefineCustomBoolVariable("hibernator.enable",
 							"Enable/disable automatic hibernation.",
 							NULL,
 							&hibernate_enabled,
@@ -139,9 +139,9 @@ DefineGUCs(void)
 							NULL,
 							NULL);
 
-	DefineCustomStringVariable("hibernate.default_database",
+	DefineCustomStringVariable("hibernator.default_database",
 							"Database to connect to, by default.",
-							"pg_hibernate will connect to this database when saving buffers, and when reading blocks of global objects.",
+							"pg_hibernator will connect to this database when saving buffers, and when reading blocks of global objects.",
 							&default_database,
 							default_database,
 							PGC_POSTMASTER,
@@ -236,6 +236,12 @@ static void
 CreateWorker(int id)
 {
 	BackgroundWorker	worker;
+
+	/*
+	 * Protect against the possibility of more members being added to the
+	 * structure than we are using below.
+	 */
+	MemSet(&worker, 0, sizeof(worker));
 
 	if (id == 0)
 	{
@@ -518,6 +524,10 @@ ReadBlocks(int filenum, char *dbname)
 				if (skip_relation || skip_fork || skip_block)
 					continue;
 
+				ereport(log_level,
+						(errmsg("reader %d reading range filenode %u forknum %d blocknum %u range %u",
+								filenum, record_filenode, record_forknum, record_blocknum, record_range)));
+
 				for (block = record_blocknum + 1; block <= (record_blocknum + record_range); ++block)
 				{
 					Buffer	buf;
@@ -535,10 +545,6 @@ ReadBlocks(int filenum, char *dbname)
 
 						break;
 					}
-
-					ereport(log_level,
-							(errmsg("reader %d reading range filenode %u forknum %d blocknum %u range %u",
-									filenum, record_filenode, record_forknum, record_blocknum, record_range)));
 
 					buf = ReadBufferExtended(rel, record_forknum, block, RBM_NORMAL, NULL);
 					ReleaseBuffer(buf);
@@ -657,9 +663,15 @@ SaveBuffers(void)
 
 	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
 
+#if PG_VERSION_NUM < 90400
+	#define LWLOCK_PARTITION(n) (FirstBufMappingLock + (n))
+#else
+	#define LWLOCK_PARTITION(n) (BufMappingPartitionLockByIndex((n)))
+#endif
+
 	/* Lock the buffer partitions */
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
-		LWLockAcquire(FirstBufMappingLock + i, LW_SHARED);
+		LWLockAcquire(LWLOCK_PARTITION(i), LW_SHARED);
 
 	/* Scan and save a list of valid buffers. */
 	for (num_buffers = 0, i = 0, bufHdr = BufferDescriptors; i < NBuffers; ++i, ++bufHdr)
@@ -688,7 +700,7 @@ SaveBuffers(void)
 	 * just as we are. Also, it doesn't hurt to follow the protocol.
 	 */
 	for (i = NUM_BUFFER_PARTITIONS - 1; i >= 0; --i)
-		LWLockRelease(FirstBufMappingLock + i);
+		LWLockRelease(LWLOCK_PARTITION(i));
 
 	/* Sort the buffers, so that we can optimize the storage of these buffers. */
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);

@@ -28,11 +28,11 @@ This extension is aimed at reducing the ramp-up time of Postgres servers.
 Compile and install the extension (of course, you'd need Postgres installation or
 source code):
 
-    $ make -C pg_hibernate/ install
+    $ make -C pg_hibernator/ install
 
 Then.
 
-1. Add `pg_hibernate` to the `shared_preload_libraries` variable in `postgresql.conf` file.
+1. Add `pg_hibernator` to the `shared_preload_libraries` variable in `postgresql.conf` file.
 2. Restart the Postgres server.
 3. You are done.
 
@@ -47,12 +47,12 @@ for restoring the buffers saved during previous shutdown.
 When the Postgres server is being stopped/shut down, the `Buffer Saver` scans the
 shared-buffers of Postgres, and stores the unique block identifiers of each cached
 block to the disk (with some optimizatins). This information is saved under the
-`$PGDATA/pg_hibernate/` directory. For each of the database whose blocks are
+`$PGDATA/pg_hibernator/` directory. For each of the database whose blocks are
 resident in shared buffers, one file is created; for eg.:
-`$PGDATA/pg_hibernate/2.postgres.save`.
+`$PGDATA/pg_hibernator/2.postgres.save`.
 
 During the next startup sequence, the `Block Reader` threads are registerd, one for
-each file present under `$PGDATA/pg_hibernate/` directory. When the Postgres server
+each file present under `$PGDATA/pg_hibernator/` directory. When the Postgres server
 has reached stable state (that is, it's ready for database connections), these
 `Block Reader` processes are launched. The `Block Reader` process reads the save-files
 looking for block-ids to restore. It then connects to the respective database,
