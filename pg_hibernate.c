@@ -128,7 +128,7 @@ static void
 DefineGUCs(void)
 {
 	/* get the configuration */
-	DefineCustomBoolVariable("hibernator.enable",
+	DefineCustomBoolVariable("pg_hibernator.enable",
 							"Enable/disable automatic hibernation.",
 							NULL,
 							&hibernate_enabled,
@@ -139,9 +139,9 @@ DefineGUCs(void)
 							NULL,
 							NULL);
 
-	DefineCustomStringVariable("hibernator.default_database",
+	DefineCustomStringVariable("pg_hibernator.default_database",
 							"Database to connect to, by default.",
-							"pg_hibernator will connect to this database when saving buffers, and when reading blocks of global objects.",
+							"Postgres Hibernator will connect to this database when saving buffers, and when reading blocks of global objects.",
 							&default_database,
 							default_database,
 							PGC_POSTMASTER,
