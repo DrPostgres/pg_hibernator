@@ -1,0 +1,148 @@
+# Turn off swap space altogether to force the OS to keep the database in memory
+# once loaded, and not spend any I/O on swapping; this is mainly to force this
+# behaiviour on my Desktop computer.
+#
+# Note that this script does not turn it back on at the end, so you need to
+# re-enable it again at the end, for your own system's performance sake.
+$ sudo swapoff -a
+
+# Disable Linux kernel CFS scheduler's auto-grouping, per Shaun Thomas' research
+# and it in fact proves to be helpful.
+$ echo 0 | sudo tee /proc/sys/kernel/sched_autogroup_enabled
+0
+
+# Define/tweak variables
+$ CORES="8"
+$ SHARED_BUFFERS="4GB"
+$ WAL_BUFFERS="16MB"
+$ CHECKPOINT_SEGMENTS="160" # Important only if tests are going to perform writes/updates.
+$ TESTDIR="./pg_hibernator_tests"
+$ PGBENCH_SCALE="260" # Set it so that it is big enough to fill up the shared_buffers
+
+# Define commands
+$ PGBENCH_INIT="pgbench --initialize --scale=$PGBENCH_SCALE pgbench"
+$ PGBENCH_RUN="pgbench --no-vacuum --protocol=prepared --time=10 --jobs=$CORES --select-only --client=$CORES pgbench"
+
+# Create a new data directory just for these tests
+$ initdb -D "$TESTDIR"
+
+# Apply our configuration
+$ echo \# Changes for pgbench testing >> "$TESTDIR"/postgresql.conf
+$ echo shared_buffers=$SHARED_BUFFERS >> "$TESTDIR"/postgresql.conf
+$ echo wal_buffers=$WAL_BUFFERS >> "$TESTDIR"/postgresql.conf
+$ echo checkpoint_segments=$CHECKPOINT_SEGMENTS >> "$TESTDIR"/postgresql.conf
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log start
+
+# Make sure we don't have a debug build of postgres
+$ psql -d postgres -c 'show debug_assertions;'
+ debug_assertions
+------------------
+ off
+(1 row)
+
+# Create and initialize the pgbench database
+$ createdb pgbench
+$ $PGBENCH_INIT
+
+# Check to make sure that the database size is big enough to fill up our shared buffers.
+$ psql -d postgres -c "select pg_size_pretty(pg_database_size('pgbench')), current_setting('shared_buffers');"
+ pg_size_pretty | current_setting
+----------------+-----------------
+ 1502 MB        | 2GB
+(1 row)
+
+## START OF TESTS ##
+
+# Enable Postgres Hibernator
+$ echo "shared_preload_libraries='pg_hibernator'" >> "$TESTDIR"/postgresql.conf
+
+# Simulate a cold-start
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log stop
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log start
+
+# Run pgbench in a loop and record the TPS. Stop the loop when a steady state
+# of TPS is reached by pressing Ctrl-C.
+#
+# Note that will take a while since this is the first time the application is
+# accessing this data, hence reading from disk will take a while.
+$ START_TIME=$SECONDS; echo TIME, TPS; while true; do TPS=$($PGBENCH_RUN | grep excluding | cut -d ' ' -f 3); TIME=$((SECONDS-START_TIME)); echo $TIME, $TPS; done
+
+# Retstart the database, with OS caches dropped to simulate cold restart.
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log stop
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log start
+
+# Run pgbench in a loop and record the TPS. Stop the loop when a steady state
+# of TPS is reached by pressing Ctrl-C.
+#
+# It should take considerably lesser time to get to the steady state because we
+# have Postgres Hibernator enabled.
+$ START_TIME=$SECONDS; echo TIME, TPS; while true; do TPS=$($PGBENCH_RUN | grep excluding | cut -d ' ' -f 3); TIME=$((SECONDS-START_TIME)); echo $TIME, $TPS; done
+
+# Retstart the database, with OS caches dropped to simulate cold restart.
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log stop
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log start
+
+# Run the same tests as earlier, but wait for the Block Reader to finish its job.
+$ while [[ $(psql -At -d postgres -c "select count(*) from pg_stat_activity where query = 'restoring buffers'") != "0" ]]; do echo sleeping; sleep 1; done
+
+# Run pgbench in a loop and record the TPS. Stop the loop when a steady state
+# of TPS is reached by pressing Ctrl-C.
+#
+# It should take considerably lesser time to get to the steady state because we
+# have Postgres Hibernator enabled, *and* we waited for the Block Reader to exit.
+$ START_TIME=$SECONDS; echo TIME, TPS; while true; do TPS=$($PGBENCH_RUN | grep excluding | cut -d ' ' -f 3); TIME=$((SECONDS-START_TIME)); echo $TIME, $TPS; done
+
+
+# Disable Postgres Hibernator.
+$ echo "shared_preload_libraries=''" >> "$TESTDIR"/postgresql.conf
+
+# Retstart the database, with OS caches dropped to simulate cold restart.
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log stop
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log start
+
+# Run pgbench in a loop and record the TPS. Stop the loop when a steady state
+# of TPS is reached by pressing Ctrl-C.
+#
+# It should take almost the same time to get to the steady state as the first
+# run, because the Postgres Hibernator is disabled.
+$ START_TIME=$SECONDS; echo TIME, TPS; while true; do TPS=$($PGBENCH_RUN | grep excluding | cut -d ' ' -f 3); TIME=$((SECONDS-START_TIME)); echo $TIME, $TPS; done
+
+# Restart t datbase server, but *don't* drop OS caches.
+#
+# This simulates a datbase restart that does not involve OS restart.
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log stop
+$ pg_ctl -w -D "$TESTDIR" -l "$TESTDIR"/server.log start
+
+# Run pgbench in a loop and record the TPS. Stop the loop when a steady state
+# of TPS is reached by pressing Ctrl-C.
+#
+# It should take almost the same time to get to the steady state as the first
+# run, because the Postgres Hibernator is disabled, and I expect the OS to have
+# also freed memory that was allocated to Postgres' data files.
+$ START_TIME=$SECONDS; echo TIME, TPS; while true; do TPS=$($PGBENCH_RUN | grep excluding | cut -d ' ' -f 3); TIME=$((SECONDS-START_TIME)); echo $TIME, $TPS; done
+
+
+# Some commands I used to monitor various things while the tests were running.
+#
+# Extract the commands to run the tests:
+grep '^\$ ' benchmark.txt | cut -d ' ' -f 2-
+
+# Loop to track TPS from database and monitor battery level on laptop, and CPU temerature:
+ LAST_COMMITS=0; SLEEP_TIME=10; while true; do BATTERY_PERC=$(upower -i /org/freedesktop/UPower/devices/battery_BAT0 |grep percentage: | awk '{print $2}'); TEMPERATURE=$(sensors | grep 'Physical id' | awk '{print $4}'); N_COMMITS=$(psql -At -d postgres -c "select xact_commit from pg_stat_database where datname = 'pgbench';"); echo BATTERY: $BATTERY_PERC, TEMP: $TEMPERATURE, TPS: $(((N_COMMITS-LAST_COMMITS)/SLEEP_TIME)); LAST_COMMITS=$N_COMMITS; sleep $SLEEP_TIME; done
+
+# Keep any eye on disk I/O and CPU consumption simultaneously.
+vmstat 10
+
+# Monitor Shared Buffer fill ratio
+while true; do psql -d postgres -c "select count(*), sum((reldatabase is not null)::int) from pg_buffercache;"; sleep 30; done
+
+
+
