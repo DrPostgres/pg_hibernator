@@ -88,8 +88,9 @@ static char*	default_database = "postgres";
 
 /*
  * Signal handler for SIGTERM
- *		Set a flag to let the main loop to terminate, and set our latch to wake
- *		it up.
+ *
+ * Used only in BufferSaver. Set a flag to notify the main loop of the signal
+ * received, and set our latch to wake it up.
  */
 static void
 sigtermHandler(SIGNAL_ARGS)
@@ -105,8 +106,9 @@ sigtermHandler(SIGNAL_ARGS)
 
 /*
  * Signal handler for SIGHUP
- *		Set a flag to let the main loop to reread the config file, and set
- *		our latch to wake it up.
+ *
+ * Used only in BufferSaver. Set a flag to notify the main loop of the signal
+ * received, and set our latch to wake it up.
  */
 static void
 sighupHandler(SIGNAL_ARGS)
@@ -116,6 +118,7 @@ sighupHandler(SIGNAL_ARGS)
 		SetLatch(&MyProc->procLatch);
 }
 
+/* This extension's entry point. */
 void
 _PG_init(void)
 {
@@ -124,11 +127,11 @@ _PG_init(void)
 	CreateWorkers();
 }
 
+/* Declare the parameters */
 static void
 DefineGUCs(void)
 {
-	/* get the configuration */
-	DefineCustomBoolVariable("pg_hibernator.enable",
+	DefineCustomBoolVariable("pg_hibernator.enabled",
 							"Enable/disable automatic hibernation.",
 							NULL,
 							&hibernate_enabled,
@@ -151,6 +154,9 @@ DefineGUCs(void)
 							NULL);
 }
 
+/*
+ * Create the directory to save files in, if it doesn't already exist.
+ */
 static void
 CreateDirectory(void)
 {
@@ -182,8 +188,13 @@ CreateDirectory(void)
 					(errcode_for_file_access(),
 					 errmsg("could not stat directory \"%s\": %m", hibernate_dir)));
 	}
+
+	/* XXX: Should we make sure we have write permissions on this directory? */
 }
 
+/*
+ * Register the BufferSaver and BlockReader worker processes.
+ */
 static void
 CreateWorkers(void)
 {
@@ -192,11 +203,12 @@ CreateWorkers(void)
 	struct dirent   *dent;
 
 	/*
-	 * Create the BufferSaver irrespective of whether the extension is enabled. The
-	 * BufferSaver will check the flag when it receives SIGTERM, and act accordingly.
-	 * This is done so that the user can start the server with the extension disabled,
-	 * enable the extension while server is running, and expect the save-files to be
-	 * created when the server shuts down.
+	 * Create the BufferSaver irrespective of whether the extension is enabled.
+	 * The BufferSaver will check the parameter when it receives SIGTERM, and act
+	 * accordingly. This way the user can start the server with the extension
+	 * disabled (pg_hibernator.enabled=false), enable the extension while
+	 * server is running, and expect the save-files to be created when the server
+	 * shuts down.
 	 */
 	CreateWorker(0);	/* Create the BufferSaver worker */
 
@@ -218,6 +230,7 @@ CreateWorkers(void)
 		int		filenum;
 		char	dbname[NAMEDATALEN];
 
+		/* Skip worker creation if we can't parse the file name. */
 		if (!parseSavefileName(dent->d_name, &filenum, dbname))
 			continue;
 
@@ -245,6 +258,7 @@ CreateWorker(int id)
 
 	if (id == 0)
 	{
+		/* Register the BufferSaver background worker */
 		worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= 0;	/* Keep the BufferSaver running */
@@ -253,6 +267,7 @@ CreateWorker(int id)
 	}
 	else
 	{
+		/* Register a BlockReader background worker process */
 		worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= BGW_NEVER_RESTART;	/* Don't restart BlockReaders upon error */
@@ -295,6 +310,10 @@ BlockReaderMain(Datum main_arg)
 				 errmsg("Block Reader %d: could not open directory \"%s\": %m",
 						id, hibernate_dir)));
 
+	/*
+	 * Reset errno before making system call, so that we don't trip over an
+	 * error that occurred earlier.
+	 */
 	errno = 0;
 	while ((dent = readdir(dir)) != NULL)
 	{
@@ -329,9 +348,10 @@ BlockReaderMain(Datum main_arg)
 	 * For any backend connected to shared-buffers, an exit code other than 0 or 1
 	 * causes a system-wide restart, so we have no choice but to use 1. Since an
 	 * ERROR also causes exit code 1, it would've been nice if we could use some
-	 * other code to signal normal exit.
+	 * other code to signal normal exit, so that a monitor could differentiate
+	 * between a successful exit, and an exit due to an ERROR.
 	 *
-	 * To get around this limitation we resort to logging a message to server log;
+	 * To get around this ambiguity we resort to logging a message to server log;
 	 * this message should console the user that everything went okay, even though
 	 * the exit code is 1.
 	 */
@@ -658,7 +678,7 @@ SaveBuffers(void)
 	 *
 	 * This is not a concern as of now, so deferred; there's at least one other
 	 * place that allocates (NBuffers * (much_bigger_struct)), so this seems to
-	 * be common practice.
+	 * be an acceptable practice.
 	 */
 
 	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
@@ -721,6 +741,12 @@ SaveBuffers(void)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "saving buffers");
 
+	/*
+	 * When we start processing a range of blocks, there's no way to know we've
+	 * reached the end of the range. So before processing any other type of
+	 * object (and at the end of all processing), we use this macro to make sure
+	 * we emit the range marker, if necessary.
+	 */
 #define WRITE_RANGE_RECORD()		\
 	do {							\
 			if (range_counter != 0)	\
@@ -827,7 +853,7 @@ SaveBuffers(void)
 			 * then emit a record for this block.
 			 */
 			WRITE_RANGE_RECORD();
-			
+
 			ereport(log_level,
 					(errmsg("writer: writing block db %d filenode %d forknum %d blocknum %d",
 							database_number, prev_filenode, prev_forknum, buf->blocknum)));
@@ -1007,7 +1033,7 @@ parseSavefileName(const char *fname, int *filenum, char *dbname)
 {
 	int dbname_len;
 
-	/* The save-file names are supposed to be in the format <integer>.<dbname>.save */
+	/* The save-file name format is: <integer>.<dbname>.save */
 
 	if (sscanf(fname, "%d.%s", filenum, dbname) != 2)
 		return false;	/* Fail if the name doesn't match the format we're expecting */
@@ -1021,4 +1047,3 @@ parseSavefileName(const char *fname, int *filenum, char *dbname)
 
 	return true;
 }
-
