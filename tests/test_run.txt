@@ -133,7 +133,7 @@ $ START_TIME=$SECONDS; echo TIME, TPS; while true; do TPS=$($PGBENCH_RUN | grep 
 # Some commands I used to monitor various things while the tests were running.
 #
 # Extract the commands to run the tests:
-grep '^\$ ' benchmark.txt | cut -d ' ' -f 2-
+grep '^\$ ' test_run.txt | cut -d ' ' -f 2-
 
 # Loop to track TPS from database and monitor battery level on laptop, and CPU temerature:
  LAST_COMMITS=0; SLEEP_TIME=10; while true; do BATTERY_PERC=$(upower -i /org/freedesktop/UPower/devices/battery_BAT0 |grep percentage: | awk '{print $2}'); TEMPERATURE=$(sensors | grep 'Physical id' | awk '{print $4}'); N_COMMITS=$(psql -At -d postgres -c "select xact_commit from pg_stat_database where datname = 'pgbench';"); echo BATTERY: $BATTERY_PERC, TEMP: $TEMPERATURE, TPS: $(((N_COMMITS-LAST_COMMITS)/SLEEP_TIME)); LAST_COMMITS=$N_COMMITS; sleep $SLEEP_TIME; done
