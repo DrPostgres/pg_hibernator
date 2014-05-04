@@ -741,34 +741,16 @@ SaveBuffers(void)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	pgstat_report_activity(STATE_RUNNING, "saving buffers");
 
-	/*
-	 * When we start processing a range of blocks, there's no way to know we've
-	 * reached the end of the range. So before processing any other type of
-	 * object (and at the end of all processing), we use this macro to make sure
-	 * we emit the range marker, if necessary.
-	 */
-#define WRITE_RANGE_RECORD()		\
-	do {							\
-			if (range_counter != 0)	\
-			{						\
-				ereport(log_level,	\
-					(errmsg("writer: writing range db %d filenode %d forknum %d blocknum %d range %d",		\
-							database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));	\
-																							\
-				fileWrite("N", 1, 1, file, savefile_name);									\
-				fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);	\
-			}																				\
-	} while(0)
-
 	for (i = 0; i < num_buffers; ++i)
 	{
+		int j;
 		SavedBuffer *buf = &saved_buffers[i];
 
 		if (i == 0 && buf->database == 0)
 		{
 			/*
 			 * Special case for global objects, if any. The qsort would've
-			 * brought then to the front of the list.
+			 * brought them to the front of the list.
 			 */
 
 			savefile_name = getDatabaseSavefileName(database_number, "global");
@@ -778,8 +760,6 @@ SaveBuffers(void)
 		if (buf->database != prev_database)
 		{
 			char *dbname;
-
-			WRITE_RANGE_RECORD();
 
 			/*
 			 * We are beginning to process a different database than the previous one;
@@ -809,8 +789,6 @@ SaveBuffers(void)
 
 		if (buf->filenode != prev_filenode)
 		{
-			WRITE_RANGE_RECORD();
-
 			/* We're beginning to process a new relation; emit a record for it. */
 			fileWrite("r", 1, 1, file, savefile_name);
 			fileWrite(&(buf->filenode), sizeof(Oid), 1, file, savefile_name);
@@ -824,8 +802,6 @@ SaveBuffers(void)
 
 		if (buf->forknum != prev_forknum)
 		{
-			WRITE_RANGE_RECORD();
-
 			/*
 			 * We're beginning to process a new fork of this relation; add a record
 			 * for it.
@@ -839,39 +815,41 @@ SaveBuffers(void)
 			range_counter	= 0;
 		}
 
-		if (prev_blocknum != InvalidBlockNumber
-			&& prev_blocknum + range_counter + 1 == buf->blocknum)
+		ereport(log_level,
+				(errmsg("writer: writing block db %d filenode %d forknum %d blocknum %d",
+						database_number, prev_filenode, prev_forknum, buf->blocknum)));
+
+		fileWrite("b", 1, 1, file, savefile_name);
+		fileWrite(&(buf->blocknum), sizeof(BlockNumber), 1, file, savefile_name);
+
+		prev_blocknum = buf->blocknum;
+		range_counter = 0;
+
+		for ( j = i+1; j < num_buffers; ++j)
 		{
-			/* We're processing a range of consecutive blocks of the relation. */
-			++range_counter;
+			SavedBuffer *tmp = &saved_buffers[j];
+
+			if (tmp->database == prev_database
+				&& tmp->filenode	== prev_filenode
+				&& tmp->forknum		== prev_forknum
+				&& tmp->blocknum	== (prev_blocknum + range_counter + 1))
+			{
+				++range_counter;
+			}
 		}
-		else
+
+		if (range_counter != 0)
 		{
-			/*
-			 * We encountered a block that's not in the continuous range of the
-			 * previous block. Emit a record for the previous range, if any, and
-			 * then emit a record for this block.
-			 */
-			WRITE_RANGE_RECORD();
-
 			ereport(log_level,
-					(errmsg("writer: writing block db %d filenode %d forknum %d blocknum %d",
-							database_number, prev_filenode, prev_forknum, buf->blocknum)));
+				(errmsg("writer: writing range db %d filenode %d forknum %d blocknum %d range %d",
+						database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));
 
-			fileWrite("b", 1, 1, file, savefile_name);
-			fileWrite(&(buf->blocknum), sizeof(BlockNumber), 1, file, savefile_name);
+			fileWrite("N", 1, 1, file, savefile_name);
+			fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);
 
-			/* Reset trackers appropriately */
-			prev_blocknum	= buf->blocknum;
-			range_counter	= 0;
+			i += range_counter;
 		}
 	}
-
-	/*
-	 * We might have exited the above loop while we were still in the middle of
-	 * processing a continuous range of blocks. Emit that record now.
-	 */
-	WRITE_RANGE_RECORD();
 
 	ereport(LOG,
 			(errmsg("Buffer Saver: saved metadata of %d blocks",
