@@ -8,6 +8,11 @@ email to Postgres hackers' mailing list.
 
 [proposal]: http://www.postgresql.org/message-id/CABwTF4Ui_anAG+ybseFunAH5Z6DE9aw2NPdy4HryK+M5OdXCCA@mail.gmail.com
 
+## Unique Feature
+
+To my knowledge, **no** other RDBMS/DBMS, commercial or open-source, provides
+this capability of saving and restoring database cache across server restarts.
+
 ## Why
 
 When a database server is shut down, for any reason (say, to apply patches, for
@@ -67,11 +72,6 @@ has reached stable state (that is, it's ready for database connections), these
 `Block Reader` processes are launched. The `Block Reader` process reads the save-files
 looking for block-ids to restore. It then connects to the respective database,
 and requests Postgres to fetch the blocks into shared-buffers.
-
-### Unique Feature
-
-To my knowledge, **no** other RDBMS/DBMS, commercial or open-source, provides
-this capability of saving and restoring database cache across restarts.
 
 ## Caveats
 
@@ -149,7 +149,8 @@ have been restored.
 
     The goal of Postgres Hibernator is to be invisible to the user/DBA.
     Whereas with `pg_prewarm` the user needs to know a lot of stuff about
-    what they really want to do, most likely inspected via `pg_buffercahce`.
+    what they really want to do, most likely information gathered via
+    `pg_buffercahce`.
 
 - Does `pg_hibernate` use either `pg_buffercache` or `pg_prewarm`?
 
@@ -169,8 +170,15 @@ have been restored.
 
 - Is this an [EDB](http://www.enterprisedb.com) product?
 
-    It's an open-source project, and it works with both
-    [Postgres](http://www.postgresql.org) and [EDB](http://www.enterprisedb.com).
+    It's an open-source project, developed by [Gurjeet Singh][gurjeet_site], an
+    EDB employee, and contributed to community. It works with both
+    [Postgres][postgres_site] and [EDB](http://www.enterprisedb.com).
+
+- What versions of Postgres/EDB are supported.
+
+    Postgres Hibernator supports [Postgres][postgres_site] and EDB's
+    [Postgres Plus Advanced Server][ppas_site] products, and versions 9.3 and
+    9.4 of both products.
 
 - Where can I learn more about it?
 
@@ -179,5 +187,11 @@ have been restored.
     Postgres Hibernator.
 
     [Proposal](http://www.postgresql.org/message-id/CABwTF4Ui_anAG+ybseFunAH5Z6DE9aw2NPdy4HryK+M5OdXCCA@mail.gmail.com)
+
     [Introducing Postrges Hibernator](http://gurjeet.singh.im/blog/2014/02/03/introducing-postgres-hibernator/)
-    [Demostrating Performance Characteristics](http://gurjeet.singh.im/blog/2014/04/30/postgres-hibernator-reduce-planned-database-down-times/)
+
+    [Demostrating Performance Benefits](http://gurjeet.singh.im/blog/2014/04/30/postgres-hibernator-reduce-planned-database-down-times/)
+
+[postgres_site]: http://www.postgresql.org
+[ppas_site]: http://enterprisedb.com/products-services-training/products/postgres-plus-advanced-server
+[gurjeet_site]: http://gurjeet.singh.im
