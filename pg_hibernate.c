@@ -664,7 +664,7 @@ SaveBuffers(void)
 	SavedBuffer			   *saved_buffers;
 	volatile BufferDesc	   *bufHdr;			// XXX: Do we really need volatile here?
 	FILE				   *file			= NULL;
-	int						database_number;
+	int						database_counter;
 	Oid						prev_database	= InvalidOid;
 	Oid						prev_filenode	= InvalidOid;
 	ForkNumber				prev_forknum	= InvalidForkNumber;
@@ -689,7 +689,7 @@ SaveBuffers(void)
 	#define LWLOCK_PARTITION(n) (BufMappingPartitionLockByIndex((n)))
 #endif
 
-	/* Lock the buffer partitions */
+	/* Lock the buffer partitions for reading. */
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
 		LWLockAcquire(LWLOCK_PARTITION(i), LW_SHARED);
 
@@ -713,28 +713,21 @@ SaveBuffers(void)
 		UnlockBufHdr(bufHdr);
 	}
 
-	/*
-	 * Unlock the buffer partitions in reverse order, to avoid deadlock. Although
-	 * this function is called during shutdown, and one would expect us to be alone,
-	 * but that may not be true, as other user/worker backends may still be alive,
-	 * just as we are. Also, it doesn't hurt to follow the protocol.
-	 */
+	/* Unlock the buffer partitions in reverse order, to avoid a deadlock. */
 	for (i = NUM_BUFFER_PARTITIONS - 1; i >= 0; --i)
 		LWLockRelease(LWLOCK_PARTITION(i));
 
-	/* Sort the buffers, so that we can optimize the storage of these buffers. */
+	/* Sort the list, so that we can optimize the storage of these buffers. */
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
 
 	/*
-	 * Number 0 is reserved; In CreateWorkers(), 0 is used to identify and register
-	 * the BufferSaver. And number 1 is reserved for save-file that contains global
-	 * objects.
+	 * Database numbers 0 and 1 are reserved; In CreateWorkers() 0 is used to
+	 * identify and register the BufferSaver, and 1 is reserved here for
+	 * save-file that contains global objects.
 	 */
-	database_number = 1;
+	database_counter = 1;
 
-	/*
-	 * Connect to the database and start a transaction for database name lookups.
-	 */
+	/* Connect to the database and start a transaction for database name lookups. */
 	BackgroundWorkerInitializeConnection(default_database, NULL);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -746,15 +739,17 @@ SaveBuffers(void)
 		int j;
 		SavedBuffer *buf = &saved_buffers[i];
 
-		if (i == 0 && buf->database == 0)
+		if (i == 0 && buf->database == InvalidOid)
 		{
 			/*
-			 * Special case for global objects, if any. The qsort would've
+			 * Special case for global objects, if any. The sort would've
 			 * brought them to the front of the list.
 			 */
 
-			savefile_name = getDatabaseSavefileName(database_number, "global");
+			savefile_name = getDatabaseSavefileName(database_counter, "global");
 			file = fileOpen(savefile_name, PG_BINARY_W);
+
+			prev_database = buf->database;
 		}
 
 		if (buf->database != prev_database)
@@ -765,7 +760,7 @@ SaveBuffers(void)
 			 * We are beginning to process a different database than the previous one;
 			 * close the save-file of previous database, and open a new one.
 			 */
-			++database_number;
+			++database_counter;
 
 			dbname = get_database_name(buf->database);
 
@@ -774,7 +769,7 @@ SaveBuffers(void)
 			if (file != NULL)
 				fileClose(file, savefile_name);
 
-			savefile_name = getDatabaseSavefileName(database_number, dbname);
+			savefile_name = getDatabaseSavefileName(database_counter, dbname);
 			file = fileOpen(savefile_name, PG_BINARY_W);
 
 			pfree(dbname);
@@ -817,12 +812,17 @@ SaveBuffers(void)
 
 		ereport(log_level,
 				(errmsg("writer: writing block db %d filenode %d forknum %d blocknum %d",
-						database_number, prev_filenode, prev_forknum, buf->blocknum)));
+						database_counter, prev_filenode, prev_forknum, buf->blocknum)));
 
 		fileWrite("b", 1, 1, file, savefile_name);
 		fileWrite(&(buf->blocknum), sizeof(BlockNumber), 1, file, savefile_name);
 
 		prev_blocknum = buf->blocknum;
+
+		/*
+		 * If a continuous range of blocks follows this block, then emit one
+		 * entry for the range, instead of one for each block.
+		 */
 		range_counter = 0;
 
 		for ( j = i+1; j < num_buffers; ++j)
@@ -842,7 +842,7 @@ SaveBuffers(void)
 		{
 			ereport(log_level,
 				(errmsg("writer: writing range db %d filenode %d forknum %d blocknum %d range %d",
-						database_number, prev_filenode, prev_forknum, prev_blocknum, range_counter)));
+						database_counter, prev_filenode, prev_forknum, prev_blocknum, range_counter)));
 
 			fileWrite("N", 1, 1, file, savefile_name);
 			fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);
@@ -852,8 +852,7 @@ SaveBuffers(void)
 	}
 
 	ereport(LOG,
-			(errmsg("Buffer Saver: saved metadata of %d blocks",
-					num_buffers)));
+			(errmsg("Buffer Saver: saved metadata of %d blocks", num_buffers)));
 
 	Assert(file != NULL);
 	fileClose(file, savefile_name);
