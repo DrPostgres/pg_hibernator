@@ -74,7 +74,7 @@ static bool		fileWrite(const void *src, size_t size, size_t n, FILE *file, const
 static const char* getDatabaseSavefileName(int filenum, const char* const dbname);
 
 /*
- * TODO: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
+ * XXX: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
  * because the worker processes are not supposed to live beyond an error anyway.
  */
 

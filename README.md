@@ -3,10 +3,16 @@
 This Postgres extension is a set-it-and-forget-it solution to save and restore
 the Postgres shared-buffers contents, across Postgres server restarts.
 
-For some details on the internals of this extension, also see the [proposal]
-email to Postgres hackers' mailing list.
+It performs the automatic save and restore of database buffers, integrated with
+database shutdown and startup, hence reducing the durations of database maintenance
+windows, in effect increasing the uptime of your applications.
 
-[proposal]: http://www.postgresql.org/message-id/CABwTF4Ui_anAG+ybseFunAH5Z6DE9aw2NPdy4HryK+M5OdXCCA@mail.gmail.com
+Postgres Hibernator automatically saves the list of shared buffers to the disk
+on database shutdown, and automatically restores the buffers on database startup.
+This acts pretty much like your Operating System's hibernate feature, except,
+instead of saving the contents of the memory to disk, Postgres Hibernator saves
+just a list of block identifiers. And it uses that list after startup to restore
+the blocks from data directory into Postgres' shared buffers.
 
 ## Unique Feature
 
@@ -15,18 +21,25 @@ this capability of saving and restoring database cache across server restarts.
 
 ## Why
 
-When a database server is shut down, for any reason (say, to apply patches, for
-scheduled maintenance, etc.), the active data-set that is cached in memory by
-the database server is lost. Upon starting up the server again, the database
-server's cache is empty, and hence almost all application queries respond slowly
-because the server has to fetch the relevant data from the disk. It takes quite a
-while for the server to bring the cache back to similar state as before the server
-shutdown.
+DBAs are often faced with the task of performing some maintenance on their
+database server(s) which requires shutting down the database. The maintenance
+may involve anything from a database patch application, to a hardware upgrade.
+One ugly side-effect of restarting the database server/service is that all the
+data currently in database server's memory will be all lost, which was
+painstakingly fetched from disk and put there in response to application queries
+over time. And this data will have to be rebuilt as applications start querying
+database again. The query response times will be very high until all the “hot”
+data is fetched from disk and put back in memory again.
+
+People employ a few tricks to get around this ugly truth, which range from
+running a `select * from app_table;`, to `dd if=table_file ...`, to using
+specialized utilities like pgfincore to prefetch data files into OS cache.
+Wouldn't it be ideal if the database itself could save and restore its memory
+contents across restarts!
 
 The duration for which the server is building up caches, and trying to reach its
-optimal cache performance is called ramp-up time.
-
-This extension is aimed at reducing the ramp-up time of Postgres servers.
+optimal cache performance is called ramp-up time. Postgres Hibernator is aimed
+at reducing the ramp-up time of Postgres servers.
 
 ## How
 
@@ -61,10 +74,9 @@ for restoring the buffers saved during previous shutdown.
 
 When the Postgres server is being stopped/shut down, the `Buffer Saver` scans the
 shared-buffers of Postgres, and stores the unique block identifiers of each cached
-block to the disk (with some optimizations). This information is saved under the
-`$PGDATA/pg_hibernator/` directory. For each of the database whose blocks are
-resident in shared buffers, one file is created; for eg.:
-`$PGDATA/pg_hibernator/2.postgres.save`.
+block to the disk. This information is saved under the `$PGDATA/pg_hibernator/`
+directory. For each of the database whose blocks are resident in shared buffers,
+one file is created; for eg.: `$PGDATA/pg_hibernator/2.postgres.save`.
 
 During the next startup sequence, the `Block Reader` threads are registerd, one for
 each file present under `$PGDATA/pg_hibernator/` directory. When the Postgres server
