@@ -27,10 +27,22 @@
 #include "storage/fd.h"
 #include "storage/relfilenode.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
+
+#if PG_VERSION_NUM == 90300
+typedef SharedState
+{
+	LWLockId	lock;
+} SharedState;
+static void		SharedStateSetup(void);
+static void		shmem_startup();
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static SharedState *shared_mem = NULL;
+#endif
 
 typedef struct SavedBuffer
 {
@@ -50,8 +62,8 @@ void			_PG_init(void);
 static void		DefineGUCs(void);
 static void		CreateDirectory(void);
 
-static void		CreateWorkers(void);
-static void		CreateWorker(int id);
+static void		RegisterBlockReaders(void);
+static bool		RegisterWorker(int id, void **handle);
 
 static void		BlockReaderMain(Datum main_arg);
 static void		ReadBlocks(int filenum, char *dbname);
@@ -62,6 +74,10 @@ static void		SaveBuffers(void);
 /* Secondary/supporting functions */
 static void		sigtermHandler(SIGNAL_ARGS);
 static void		sighupHandler(SIGNAL_ARGS);
+
+#if PG_VERSION_NUM >= 90400
+static void		addPendingWorker(int filenum);
+#endif
 
 static void		WorkerCommon(void);
 static int		SavedBufferCmp(const void *a, const void *b);
@@ -83,8 +99,9 @@ static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
 /* GUC variables */
-static bool		hibernate_enabled = true;
-static char*	default_database = "postgres";
+static bool		guc_enabled = true;					/* Is the extension enabled? */
+static bool		guc_parallel_enabled = false;		/* Can we restore databases in parallel? */
+static char*	guc_default_database = "postgres";	/* Default DB to connect to. */
 
 /*
  * Signal handler for SIGTERM
@@ -122,10 +139,75 @@ sighupHandler(SIGNAL_ARGS)
 void
 _PG_init(void)
 {
+#if PG_VERSION_NUM == 90300
+	SharedStateSetup();
+#endif
 	DefineGUCs();
 	CreateDirectory();
-	CreateWorkers();
+	/*
+	 * Create the BufferSaver irrespective of whether the extension is enabled.
+	 * The BufferSaver will check the parameter when it receives SIGTERM, and act
+	 * accordingly. This way the user can start the server with the extension
+	 * disabled (pg_hibernator.enabled=false), enable the extension while
+	 * server is running, and expect the save-files to be created when the server
+	 * shuts down.
+	 */
+	 /* Register the BufferSaver worker */
+	RegisterWorker(0, NULL);
+
+#if PG_VERSION_NUM >= 90400
+	/*
+	 * In Postgres version 9.4 and above, we use the dynamic background worker
+	 * infrastructure for BlockReaders, and the BufferSaver process does the
+	 * legwork of registering the BlockReader workers.
+	 */
+#else	/* PG_VERSION_NUM == 90300 */
+
+	/*
+	 * In Postgres 9.3 we use regular workers for BlockReader processes, and
+	 * they are registered right here.
+	 */
+
+	RegisterBlockReaders(); /* Register the BlockReader worker processes */
+#endif
 }
+
+#if PG_VERSION_NUM == 90300
+static void
+SharedStateSetup()
+{
+	/* Request one LWLock */
+	RequestAddinLWLocks(1);
+
+	/* Register our hook for Shared Memory initialization */
+    prev_shmem_startup_hook = shmem_startup_hook;
+    shmem_startup_hook = shmem_startup;
+}
+
+static void
+shmem_startup()
+{
+	bool found;
+
+    /* reset in case this is a restart within the postmaster */
+    shared_mem = NULL;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	shared_mem = ShmemInitStruct("pg_hibernator",
+                           sizeof(SharedState),
+                           &found);
+    if (!found)
+    {
+        /* First time through */
+        shared_mem->lock = LWLockAssign();
+    }
+
+    LWLockRelease(AddinShmemInitLock);
+}
+#endif
 
 /* Declare the parameters */
 static void
@@ -134,8 +216,19 @@ DefineGUCs(void)
 	DefineCustomBoolVariable("pg_hibernator.enabled",
 							"Enable/disable automatic hibernation.",
 							NULL,
-							&hibernate_enabled,
-							true,
+							&guc_enabled,
+							guc_enabled,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("pg_hibernator.parallel",
+							"Enable/disable restoring databases in parallel.",
+							NULL,
+							&guc_parallel_enabled,
+							guc_parallel_enabled,
 							PGC_SIGHUP,
 							0,
 							NULL,
@@ -145,8 +238,8 @@ DefineGUCs(void)
 	DefineCustomStringVariable("pg_hibernator.default_database",
 							"Database to connect to, by default.",
 							"Postgres Hibernator will connect to this database when saving buffers, and when reading blocks of global objects.",
-							&default_database,
-							default_database,
+							&guc_default_database,
+							guc_default_database,
 							PGC_POSTMASTER,
 							0,
 							NULL,
@@ -192,28 +285,15 @@ CreateDirectory(void)
 	/* XXX: Should we make sure we have write permissions on this directory? */
 }
 
-/*
- * Register the BufferSaver and BlockReader worker processes.
- */
 static void
-CreateWorkers(void)
+RegisterBlockReaders(void)
 {
 	DIR			   *dir;
 	const char	   *hibernate_dir;
 	struct dirent   *dent;
 
-	/*
-	 * Create the BufferSaver irrespective of whether the extension is enabled.
-	 * The BufferSaver will check the parameter when it receives SIGTERM, and act
-	 * accordingly. This way the user can start the server with the extension
-	 * disabled (pg_hibernator.enabled=false), enable the extension while
-	 * server is running, and expect the save-files to be created when the server
-	 * shuts down.
-	 */
-	CreateWorker(0);	/* Create the BufferSaver worker */
-
 	/* Don't create BlockReaders if the extension is disabled. */
-	if (!hibernate_enabled)
+	if (!guc_enabled)
 		return;
 
 	hibernate_dir = SAVE_LOCATION;
@@ -234,7 +314,11 @@ CreateWorkers(void)
 		if (!parseSavefileName(dent->d_name, &filenum, dbname))
 			continue;
 
-		CreateWorker(filenum);
+#if PG_VERSION_NUM >= 90400
+		addPendingWorker(filenum);
+#else	/* PG_VERSION_NUM == 90300 */
+		RegisterWorker(filenum, NULL);
+#endif
 	}
 
 	if (errno != 0)
@@ -245,8 +329,68 @@ CreateWorkers(void)
 	closedir(dir);
 }
 
+#if PG_VERSION_NUM >= 90400
+
+/* Used by BufferSaver */
+static List *pendingWorkers = NIL;
+
 static void
-CreateWorker(int id)
+addPendingWorker(int filenum)
+{
+	MemoryContext oldContext = MemoryContextSwitchTo(TopMemoryContext);
+
+	pendingWorkers = lappend_int(pendingWorkers, filenum);
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+static void
+processOnePendingWorker()
+{
+	static BackgroundWorkerHandle *last_worker = NULL;
+
+	/* Nothing to do if the list is empty. */
+	if (list_length(pendingWorkers) == 0)
+		return;
+
+	if (last_worker != NULL)
+	{
+		pid_t pid;
+		BgwHandleStatus status = GetBackgroundWorkerPid(last_worker, &pid);
+
+		switch (status)
+		{
+			case BGWH_STARTED:
+			case BGWH_NOT_YET_STARTED:
+				/* Do nothing if parallelism is disabled */
+				if (!guc_parallel_enabled)
+					return;
+
+				/* Fall through */
+			case BGWH_STOPPED:
+				last_worker = NULL;
+				break;
+			default:
+				Assert(false);
+				break;
+		}
+	}
+
+	if (!RegisterWorker(linitial_int(pendingWorkers), (void**) &last_worker))
+		return;
+
+	/* Remove the element from pending list iff we could register a worker successfully. */
+	pendingWorkers = list_delete_first(pendingWorkers);
+}
+
+#endif
+
+/*
+ * The second parameter is declared void** because the type BackgroundWorkerHandle
+ * is not available in Postgres 9.3.
+ */
+static bool
+RegisterWorker(int id, void **handle)
 {
 	BackgroundWorker	worker;
 
@@ -277,7 +421,16 @@ CreateWorker(int id)
 
 	worker.bgw_main_arg = Int32GetDatum(id);
 
+#if PG_VERSION_NUM >= 90400
+	return RegisterDynamicBackgroundWorker(&worker, (BackgroundWorkerHandle**) handle);
+#else
+	/*
+	 * This API is deficient as it can't report failure; it just does an
+	 * ereport(LOG) on failure.
+	 */
 	RegisterBackgroundWorker(&worker);
+	return true;
+#endif
 }
 
 static void
@@ -340,7 +493,19 @@ BlockReaderMain(Datum main_arg)
 	closedir(dir);
 
 	/* We found the file we're supposed to restore. */
+
+#if PG_VERSION_NUM == 90300
+	/* If parallelism is disabled, wait until it's our turn to read blocks. */
+	if (!guc_parallel_enabled)
+		LWLockAcquire(shared_mem->lock, LW_EXCLUSIVE);
+#endif
+
 	ReadBlocks(filenum, dbname);
+
+#if PG_VERSION_NUM == 90300
+	if (!guc_parallel_enabled)
+		LWLockRelease(shared_mem->lock);
+#endif
 
 	/*
 	 * Exit with non-zero status to ensure that this worker is not restarted.
@@ -390,7 +555,7 @@ ReadBlocks(int filenum, char *dbname)
 	file = fileOpen(filename, PG_BINARY_R);
 
 	/* To restore the global objects, use default database */
-	BackgroundWorkerInitializeConnection(filenum == 1 ? default_database : dbname, NULL);
+	BackgroundWorkerInitializeConnection(filenum == 1 ? guc_default_database : dbname, NULL);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
@@ -609,21 +774,32 @@ BufferSaverMain(Datum main_arg)
 {
 	WorkerCommon();
 
+#if PG_VERSION_NUM >= 90400
+	RegisterBlockReaders();
+#endif
+
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
 	 */
 	while (!got_sigterm)
 	{
 		int	rc;
+		int sleepTime;
 
+#if PG_VERSION_NUM >= 90400
+		processOnePendingWorker();
+		sleepTime = (list_length(pendingWorkers) == 0 ? 10 : 1);
+#else
+		sleepTime = 10;
+#endif
 		/*
-		 * Wait on the process latch, which sleeps as necessary, but is awakened if
-		 * postmaster dies. This way the background process goes away immediately
-		 * in case of an emergency.
+		 * Wait on the process latch, which sleeps as necessary, but is awakened
+		 * if postmaster dies. This way the background process goes away
+		 * immediately in case of an emergency.
 		 */
 		rc = WaitLatch(&MyProc->procLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   10 * 1000L);
+					   sleepTime * 1000L);
 		ResetLatch(&MyProc->procLatch);
 
 		/* emergency bailout if postmaster has died */
@@ -646,7 +822,7 @@ BufferSaverMain(Datum main_arg)
 	 */
 
 	/* Save the buffers only if the extension is enabled. */
-	if (hibernate_enabled)
+	if (guc_enabled)
 		SaveBuffers();
 
 	/*
@@ -721,14 +897,14 @@ SaveBuffers(void)
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
 
 	/*
-	 * Database numbers 0 and 1 are reserved; In CreateWorkers() 0 is used to
+	 * Database numbers 0 and 1 are reserved; In _PG_init() 0 is used to
 	 * identify and register the BufferSaver, and 1 is reserved here for
 	 * save-file that contains global objects.
 	 */
 	database_counter = 1;
 
 	/* Connect to the database and start a transaction for database name lookups. */
-	BackgroundWorkerInitializeConnection(default_database, NULL);
+	BackgroundWorkerInitializeConnection(guc_default_database, NULL);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
