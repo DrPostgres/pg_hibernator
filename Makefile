@@ -1,7 +1,7 @@
 # contrib/pg_hibernator/Makefile
 
 MODULE_big = pg_hibernator
-OBJS = pg_hibernate.o
+OBJS = pg_hibernate.o pg_hibernate_9.3.o
 
 PG_CONFIG = pg_config
 

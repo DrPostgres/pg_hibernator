@@ -1,6 +1,6 @@
 #include "postgres.h"
 
-#if PG_VERSION_NUM >= 90400
+#if PG_VERSION_NUM == 90300
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -37,18 +37,8 @@ PG_MODULE_MAGIC;
 /*
  * Overall flow of control:
  *
- * _PG_init() registers a BGWorker for BufferSaver process.
- *
- * When launched, the BufferSaver process scans the $PGDATA/pg_hibernator/
- * directory, and adds one item in its "pending" list for each save-file found
- * in that directory. The "pending" list is maintained instead of registering
- * BGWorkers right away, because the number of workers needed to restore all the
- * databases may be greater than max_worker_processes.
- *
- * The BufferSaver calls processOnePendingWorker() periodically, which in turn
- * waits for any currently running BlockReader to exit, and then registers a new
- * dynamic background worker to run a new BlockReader for the first item on the
- * "pending" list.
+ * _PG_init() registers a BGWorker for BufferSaver process, and one BGWorker
+ * each for the save-files it finds in $PGDATA/pg_hibernator/.
  *
  * On shutdown request, the BufferSaver scans the shared buffers and saves the
  * list of blocks currently in memory to the $PGDATA/pg_hibernator/ directory,
@@ -58,6 +48,15 @@ PG_MODULE_MAGIC;
  * to the database represented by that save-file, and restores the blocks
  * identified by the list of blocks in save-file.
  */
+
+typedef SharedState
+{
+	LWLockId	lock;
+} SharedState;
+static void		SharedStateSetup(void);
+static void		shmem_startup();
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static SharedState *shared_mem = NULL;
 
 typedef struct SavedBuffer
 {
@@ -78,7 +77,7 @@ static void		DefineGUCs(void);
 static void		CreateDirectory(void);
 
 static void		RegisterBlockReaders(void);
-static bool		RegisterWorker(int id, BackgroundWorkerHandle **handle);
+static bool		RegisterWorker(int id);
 
 static void		BlockReaderMain(Datum main_arg);
 static void		ReadBlocks(int filenum, char *dbname);
@@ -89,9 +88,6 @@ static void		SaveBuffers(void);
 /* Secondary/supporting functions */
 static void		sigtermHandler(SIGNAL_ARGS);
 static void		sighupHandler(SIGNAL_ARGS);
-
-static void		addPendingWorker(int filenum);
-static void		processOnePendingWorker(void);
 
 static void		WorkerCommon(void);
 static int		SavedBufferCmp(const void *a, const void *b);
@@ -107,9 +103,6 @@ static const char* getDatabaseSavefileName(int filenum, const char* const dbname
  * XXX: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
  * because the worker processes are not supposed to live beyond an error anyway.
  */
-
-/* Global variables */
-static List *pendingWorkers = NIL;	/* Used by BufferSaver */
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
@@ -156,6 +149,7 @@ sighupHandler(SIGNAL_ARGS)
 void
 _PG_init(void)
 {
+	SharedStateSetup();
 	DefineGUCs();
 	CreateDirectory();
 	/*
@@ -167,13 +161,53 @@ _PG_init(void)
 	 * shuts down.
 	 */
 	 /* Register the BufferSaver worker */
-	RegisterWorker(0, NULL);
+	RegisterWorker(0);
 
 	/*
 	 * In Postgres version 9.4 and above, we use the dynamic background worker
 	 * infrastructure for BlockReaders, and the BufferSaver process does the
 	 * legwork of registering the BlockReader workers.
 	 */
+	/*
+	 * In Postgres 9.3 we use regular workers for BlockReader processes, and
+	 * they are registered right here.
+	 */
+	RegisterBlockReaders(); /* Register the BlockReader worker processes */
+}
+
+static void
+SharedStateSetup()
+{
+	/* Request one LWLock */
+	RequestAddinLWLocks(1);
+
+	/* Register our hook for Shared Memory initialization */
+    prev_shmem_startup_hook = shmem_startup_hook;
+    shmem_startup_hook = shmem_startup;
+}
+
+static void
+shmem_startup()
+{
+	bool found;
+
+    /* reset in case this is a restart within the postmaster */
+    shared_mem = NULL;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	shared_mem = ShmemInitStruct("pg_hibernator",
+                           sizeof(SharedState),
+                           &found);
+    if (!found)
+    {
+        /* First time through */
+        shared_mem->lock = LWLockAssign();
+    }
+
+    LWLockRelease(AddinShmemInitLock);
 }
 
 /* Declare the parameters */
@@ -281,7 +315,7 @@ RegisterBlockReaders(void)
 		if (!parseSavefileName(dent->d_name, &filenum, dbname))
 			continue;
 
-		addPendingWorker(filenum);
+		RegisterWorker(filenum);
 	}
 
 	if (errno != 0)
@@ -292,57 +326,12 @@ RegisterBlockReaders(void)
 	closedir(dir);
 }
 
-static void
-addPendingWorker(int filenum)
-{
-	MemoryContext oldContext = MemoryContextSwitchTo(TopMemoryContext);
-
-	pendingWorkers = lappend_int(pendingWorkers, filenum);
-
-	MemoryContextSwitchTo(oldContext);
-}
-
-static void
-processOnePendingWorker()
-{
-	static BackgroundWorkerHandle *last_worker = NULL;
-
-	/* Nothing to do if the list is empty. */
-	if (list_length(pendingWorkers) == 0)
-		return;
-
-	if (last_worker != NULL)
-	{
-		pid_t pid;
-		BgwHandleStatus status = GetBackgroundWorkerPid(last_worker, &pid);
-
-		switch (status)
-		{
-			case BGWH_STARTED:
-			case BGWH_NOT_YET_STARTED:
-				/* Do nothing if parallelism is disabled */
-				if (!guc_parallel_enabled)
-					return;
-
-				/* Fall through */
-			case BGWH_STOPPED:
-				last_worker = NULL;
-				break;
-			default:
-				Assert(false);
-				break;
-		}
-	}
-
-	if (!RegisterWorker(linitial_int(pendingWorkers), &last_worker))
-		return;
-
-	/* Remove the element from pending list iff we could register a worker successfully. */
-	pendingWorkers = list_delete_first(pendingWorkers);
-}
-
+/*
+ * The second parameter is declared void** because the type BackgroundWorkerHandle
+ * is not available in Postgres 9.3.
+ */
 static bool
-RegisterWorker(int id, BackgroundWorkerHandle **handle)
+RegisterWorker(int id)
 {
 	BackgroundWorker	worker;
 
@@ -372,8 +361,12 @@ RegisterWorker(int id, BackgroundWorkerHandle **handle)
 	}
 
 	worker.bgw_main_arg = Int32GetDatum(id);
-
-	return RegisterDynamicBackgroundWorker(&worker, handle);
+	/*
+	 * This API is deficient as it can't report failure; it just does an
+	 * ereport(LOG) on failure.
+	 */
+	RegisterBackgroundWorker(&worker);
+	return true;
 }
 
 static void
@@ -437,7 +430,14 @@ BlockReaderMain(Datum main_arg)
 
 	/* We found the file we're supposed to restore. */
 
+	/* If parallelism is disabled, wait until it's our turn to read blocks. */
+	if (!guc_parallel_enabled)
+		LWLockAcquire(shared_mem->lock, LW_EXCLUSIVE);
+
 	ReadBlocks(filenum, dbname);
+
+	if (!guc_parallel_enabled)
+		LWLockRelease(shared_mem->lock);
 
 	/*
 	 * Exit with non-zero status to ensure that this worker is not restarted.
@@ -706,8 +706,6 @@ BufferSaverMain(Datum main_arg)
 {
 	WorkerCommon();
 
-	RegisterBlockReaders();
-
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
 	 */
@@ -716,9 +714,7 @@ BufferSaverMain(Datum main_arg)
 		int	rc;
 		int sleepTime;
 
-		processOnePendingWorker();
-		sleepTime = (list_length(pendingWorkers) == 0 ? 10 : 1);
-
+		sleepTime = 10;
 		/*
 		 * Wait on the process latch, which sleeps as necessary, but is awakened
 		 * if postmaster dies. This way the background process goes away
@@ -786,7 +782,7 @@ SaveBuffers(void)
 
 	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
 
-#define LWLOCK_PARTITION(n) (BufMappingPartitionLockByIndex((n)))
+#define LWLOCK_PARTITION(n) (FirstBufMappingLock + (n))
 
 	/* Lock the buffer partitions for reading. */
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
@@ -1124,4 +1120,4 @@ parseSavefileName(const char *fname, int *filenum, char *dbname)
 	return true;
 }
 
-#endif /* if PG_VERSION_NUM >= 90400 */
+#endif /* PG_VERSION_NUM == 90300 */
