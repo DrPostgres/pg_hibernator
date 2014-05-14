@@ -123,8 +123,8 @@ static char*	guc_default_database = "postgres";	/* Default DB to connect to. */
 /*
  * Signal handler for SIGTERM
  *
- * Used only in BufferSaver. Set a flag to notify the main loop of the signal
- * received, and set our latch to wake it up.
+ * Set a flag to notify the main loop of the signal received, and set our latch
+ * to wake it up.
  */
 static void
 sigtermHandler(SIGNAL_ARGS)
@@ -148,6 +148,19 @@ static void
 sighupHandler(SIGNAL_ARGS)
 {
 	got_sighup = true;
+	if (MyProc)
+		SetLatch(&MyProc->procLatch);
+}
+
+/*
+ * Signal handler for SIGUSR1
+ *
+ * Used only in BufferSaver. Notify the main loop of the signal received; set
+ * our latch to wake it up.
+ */
+static void
+sigusr1Handler(SIGNAL_ARGS)
+{
 	if (MyProc)
 		SetLatch(&MyProc->procLatch);
 }
@@ -352,6 +365,8 @@ RegisterWorker(int id, BackgroundWorkerHandle **handle)
 	 */
 	MemSet(&worker, 0, sizeof(worker));
 
+	worker.bgw_main_arg = Int32GetDatum(id);
+
 	if (id == 0)
 	{
 		/* Register the BufferSaver background worker */
@@ -360,6 +375,8 @@ RegisterWorker(int id, BackgroundWorkerHandle **handle)
 		worker.bgw_restart_time	= 0;	/* Keep the BufferSaver running */
 		worker.bgw_main			= BufferSaverMain;
 		snprintf(worker.bgw_name, BGW_MAXLEN, "Buffer Saver");
+		RegisterBackgroundWorker(&worker);
+		return true;
 	}
 	else
 	{
@@ -368,12 +385,10 @@ RegisterWorker(int id, BackgroundWorkerHandle **handle)
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= BGW_NEVER_RESTART;	/* Don't restart BlockReaders upon error */
 		worker.bgw_main			= BlockReaderMain;
+		worker.bgw_notify_pid	= MyProcPid;			/* Send me SIGUSR1 when a BGWorker is created or dies. */
 		snprintf(worker.bgw_name, BGW_MAXLEN, "Block Reader %d", id);
+		return RegisterDynamicBackgroundWorker(&worker, handle);
 	}
-
-	worker.bgw_main_arg = Int32GetDatum(id);
-
-	return RegisterDynamicBackgroundWorker(&worker, handle);
 }
 
 static void
@@ -382,6 +397,7 @@ WorkerCommon(void)
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, sighupHandler);
 	pqsignal(SIGTERM, sigtermHandler);
+	pqsignal(SIGUSR1, sigusr1Handler);
 
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
@@ -714,10 +730,9 @@ BufferSaverMain(Datum main_arg)
 	while (!got_sigterm)
 	{
 		int	rc;
-		int sleepTime;
 
+		ResetLatch(&MyProc->procLatch);
 		processOnePendingWorker();
-		sleepTime = (list_length(pendingWorkers) == 0 ? 10 : 1);
 
 		/*
 		 * Wait on the process latch, which sleeps as necessary, but is awakened
@@ -726,8 +741,7 @@ BufferSaverMain(Datum main_arg)
 		 */
 		rc = WaitLatch(&MyProc->procLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   sleepTime * 1000L);
-		ResetLatch(&MyProc->procLatch);
+					   10 * 1000L);
 
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
@@ -786,11 +800,9 @@ SaveBuffers(void)
 
 	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
 
-#define LWLOCK_PARTITION(n) (BufMappingPartitionLockByIndex((n)))
-
 	/* Lock the buffer partitions for reading. */
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
-		LWLockAcquire(LWLOCK_PARTITION(i), LW_SHARED);
+		LWLockAcquire(BufMappingPartitionLockByIndex(i), LW_SHARED);
 
 	/* Scan and save a list of valid buffers. */
 	for (num_buffers = 0, i = 0, bufHdr = BufferDescriptors; i < NBuffers; ++i, ++bufHdr)
@@ -814,7 +826,7 @@ SaveBuffers(void)
 
 	/* Unlock the buffer partitions in reverse order, to avoid a deadlock. */
 	for (i = NUM_BUFFER_PARTITIONS - 1; i >= 0; --i)
-		LWLockRelease(LWLOCK_PARTITION(i));
+		LWLockRelease(BufMappingPartitionLockByIndex(i));
 
 	/* Sort the list, so that we can optimize the storage of these buffers. */
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
@@ -1124,4 +1136,4 @@ parseSavefileName(const char *fname, int *filenum, char *dbname)
 	return true;
 }
 
-#endif /* if PG_VERSION_NUM >= 90400 */
+#endif /* PG_VERSION_NUM >= 90400 */

@@ -53,6 +53,7 @@ typedef SharedState
 {
 	LWLockId	lock;
 } SharedState;
+
 static void		SharedStateSetup(void);
 static void		shmem_startup();
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -116,8 +117,8 @@ static char*	guc_default_database = "postgres";	/* Default DB to connect to. */
 /*
  * Signal handler for SIGTERM
  *
- * Used only in BufferSaver. Set a flag to notify the main loop of the signal
- * received, and set our latch to wake it up.
+ * Set a flag to notify the main loop of the signal received, and set our latch
+ * to wake it up.
  */
 static void
 sigtermHandler(SIGNAL_ARGS)
@@ -326,10 +327,6 @@ RegisterBlockReaders(void)
 	closedir(dir);
 }
 
-/*
- * The second parameter is declared void** because the type BackgroundWorkerHandle
- * is not available in Postgres 9.3.
- */
 static bool
 RegisterWorker(int id)
 {
@@ -340,6 +337,8 @@ RegisterWorker(int id)
 	 * structure than we are using below.
 	 */
 	MemSet(&worker, 0, sizeof(worker));
+
+	worker.bgw_main_arg = Int32GetDatum(id);
 
 	if (id == 0)
 	{
@@ -360,7 +359,6 @@ RegisterWorker(int id)
 		snprintf(worker.bgw_name, BGW_MAXLEN, "Block Reader %d", id);
 	}
 
-	worker.bgw_main_arg = Int32GetDatum(id);
 	/*
 	 * This API is deficient as it can't report failure; it just does an
 	 * ereport(LOG) on failure.
@@ -431,6 +429,15 @@ BlockReaderMain(Datum main_arg)
 	/* We found the file we're supposed to restore. */
 
 	/* If parallelism is disabled, wait until it's our turn to read blocks. */
+
+	/*
+	 * Despite the warning on LWLockAcquire() that an LWLock should not be held
+	 * for more than a few seconds, because holding one causes the query-cancel
+	 * and die signals are blocked, I think it's safe to hold an LWLock around
+	 * a database buffer restore operation since we're a background worker and
+	 * query-cancel is intended for regular backends, and die() (a.k.a SIGTERM)
+	 * is handled by us, and we promptly honor it.
+	 */
 	if (!guc_parallel_enabled)
 		LWLockAcquire(shared_mem->lock, LW_EXCLUSIVE);
 
@@ -598,7 +605,7 @@ ReadBlocks(int filenum, char *dbname)
 
 				/*
 				 * Don't try to read past the file; the file may have been shrunk
-				 * by a vaccum operation.
+				 * by a vaccum/truncate operation.
 				 */
 				if (record_blocknum >= nblocks)
 				{
@@ -712,9 +719,9 @@ BufferSaverMain(Datum main_arg)
 	while (!got_sigterm)
 	{
 		int	rc;
-		int sleepTime;
 
-		sleepTime = 10;
+		ResetLatch(&MyProc->procLatch);
+
 		/*
 		 * Wait on the process latch, which sleeps as necessary, but is awakened
 		 * if postmaster dies. This way the background process goes away
@@ -722,8 +729,7 @@ BufferSaverMain(Datum main_arg)
 		 */
 		rc = WaitLatch(&MyProc->procLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   sleepTime * 1000L);
-		ResetLatch(&MyProc->procLatch);
+					   10 * 1000L);
 
 		/* emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
@@ -782,11 +788,9 @@ SaveBuffers(void)
 
 	saved_buffers = (SavedBuffer *) palloc(sizeof(SavedBuffer) * NBuffers);
 
-#define LWLOCK_PARTITION(n) (FirstBufMappingLock + (n))
-
 	/* Lock the buffer partitions for reading. */
 	for (i = 0; i < NUM_BUFFER_PARTITIONS; ++i)
-		LWLockAcquire(LWLOCK_PARTITION(i), LW_SHARED);
+		LWLockAcquire(FirstBufMappingLock + i, LW_SHARED);
 
 	/* Scan and save a list of valid buffers. */
 	for (num_buffers = 0, i = 0, bufHdr = BufferDescriptors; i < NBuffers; ++i, ++bufHdr)
@@ -810,7 +814,7 @@ SaveBuffers(void)
 
 	/* Unlock the buffer partitions in reverse order, to avoid a deadlock. */
 	for (i = NUM_BUFFER_PARTITIONS - 1; i >= 0; --i)
-		LWLockRelease(LWLOCK_PARTITION(i));
+		LWLockRelease(FirstBufMappingLock + i);
 
 	/* Sort the list, so that we can optimize the storage of these buffers. */
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
