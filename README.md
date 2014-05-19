@@ -85,25 +85,63 @@ has reached stable state (that is, it's ready for database connections), these
 looking for block-ids to restore. It then connects to the respective database,
 and requests Postgres to fetch the blocks into shared-buffers.
 
+## Configuration
+
+This extension can be controlled via the following parameters. These parameters
+can be set in postgresql.conf or on postmaster's command-line.
+
+- `pg_hibernator.enabled`
+
+    Setting this parameter to false disables the hibernator features. That is,
+    on server startup the BlockReader processes will not be launched, and on
+    server shutdown the list of blicks in shared buffers will not be saved.
+
+    Note that the BuffersSaver process exists at all times, even when this
+    parameter is set to `false`. This is to allow the DBA to enable/disable the
+    extension without having to restart the server. The BufferSaver process
+    checks this parameter during server startup and right before shutdown, and
+    honors this parameter's value at that time.
+
+    To enable/disable Postgres Hibernator at runtime, change the value in
+    `postgresql.conf` and use `pg_ctl reload` to make Postgres re-read the new
+    parameter values from `postgresql.conf`.
+
+    Default value: `true`.
+
+- `pg_hibernator.parallel`
+
+    This parameter controls whether Postgres Hibernator launches the BlockReader
+    processes in parallel, or sequentially, waiting for current BlockReader to
+    exit before launching the next one.
+
+    When enabled, all the BlockReaders, one for each database, will be launched
+    simultaneously, and this may cause huge random-read flood on disks if there
+    are many databases in cluster. This may also cause some BlockReaders to fail
+    to launch successfully because of `max_worker_processes` limit.
+
+    Default value: `false`.
+
+- `pg_hibernator.default_database`
+
+    The BufferSaver process needs to connect to a database in order to perform
+    the database-name lookups etc. This parameter controls which database the
+    BufferSaver process connects to for perfoming these operations.
+
+    Default value: `postgres`.
+
 ## Caveats
 
 - Buffer list is saved only when Postgres is shutdown in "smart" and "fast" modes.
 
-    That is, buffer list is not saved when database crashes, or on "immediate" shutdown.
+    That is, buffer list is not saved when database crashes, or on "immediate"
+    shutdown.
 
 - A reduction in `shared_buffers` is not detected.
 
-    If the `shared_buffers` is reduced across a restart, Postgres Hibernator
-continues to read an restore blocks even after `shared_buffers` worth of buffers
-have been restored.
-
-- All Block Readers (one for each DB in cluster) are launched at the same time.
-
-    This may cause huge random-read flood on disks if there are many databases
-    in cluster.
-
-    This may also cause some Readers to fail to launch in PG 9.4, because of
-    `max_worker_processes`.
+    If the `shared_buffers` is reduced across a restart, and if the combined
+    saved buffer list is larger than the new shared_buffers lize, Postgres
+    Hibernator continues to read and restore blocks even after `shared_buffers`
+    worth of buffers have been restored.
 
 ## Nice-to-have features
 
@@ -116,9 +154,8 @@ have been restored.
 
     I looked at `pgfincore`, but decided against including that feature-set
     in Postgres Hibernator because, (a) `pgfincore` requires the user to know
-    beforehand which tables/indexes they will need in future, and
-    (b) Postgres Hibernator is supposed to be as invisible to the user/DBA as
-    possible.
+    beforehand which tables/indexes they will need in future, and (b) Postgres
+    Hibernator is supposed to be as invisible to the user/DBA as possible.
 
     One possible solution is to hook into Postgres' buffer-eviction code (at the
     end of `BufferAlloc()`), and keep track of which buffers are being evicted.
