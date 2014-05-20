@@ -1,6 +1,6 @@
 #include "postgres.h"
 
-#if PG_VERSION_NUM == 90300
+#if PG_VERSION_NUM >= 90300 && PG_VERSION_NUM < 90400
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -49,7 +49,7 @@ PG_MODULE_MAGIC;
  * identified by the list of blocks in save-file.
  */
 
-typedef SharedState
+typedef struct SharedState
 {
 	LWLockId	lock;
 } SharedState;
