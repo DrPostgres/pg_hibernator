@@ -568,15 +568,14 @@ ReadBlocks(int filenum, char *dbname)
 				record_blocknum = InvalidBlockNumber;
 				nblocks = 0;
 
+				fileRead(&record_forknum, sizeof(ForkNumber), 1, file, false, filename);
+
 				if (skip_relation)
 					continue;
 
-				Assert(rel != NULL);
 				if (rel == NULL)
 					ereport(ERROR,
 							(errmsg("found a fork record without a preceeding relation record")));
-
-				fileRead(&record_forknum, sizeof(ForkNumber), 1, file, false, filename);
 
 				ereport(log_level, (errmsg("processing fork %d", record_forknum)));
 
@@ -592,8 +591,6 @@ ReadBlocks(int filenum, char *dbname)
 			break;
 			case 'b':
 			{
-				Assert(rel != NULL);
-
 				if (record_forknum == InvalidForkNumber)
 					ereport(ERROR,
 							(errmsg("found a block record without a preceeding fork record")));
@@ -679,9 +676,9 @@ ReadBlocks(int filenum, char *dbname)
 			break;
 			default:
 			{
-				Assert(false);
 				ereport(ERROR,
 						(errmsg("found unexpected save-file marker %x - %c)", record_type, record_type)));
+				Assert(false);
 			}
 			break;
 		}
