@@ -41,7 +41,7 @@ PG_MODULE_MAGIC;
  * each for the save-files it finds in $PGDATA/pg_hibernator/.
  *
  * On shutdown request, the BufferSaver scans the shared buffers and saves the
- * list of blocks currently in memory to the $PGDATA/pg_hibernator/ directory,
+ * list of blocks currently in memory to the $PGDATA/pg_hibernator/ directory;
  * one save-file for each database.
  *
  * When launched, the BlockReader reads the save-file assigned to it, connects
@@ -99,11 +99,6 @@ static bool		fileClose(FILE *file, const char *path);
 static bool		fileRead(void *dest, size_t size, size_t n, FILE *file, bool eof_ok, const char *path);
 static bool		fileWrite(const void *src, size_t size, size_t n, FILE *file, const char *path);
 static const char* getDatabaseSavefileName(int filenum, const char* const dbname);
-
-/*
- * XXX: Consider if all ereport(ERROR) calls should be converted to ereport(FATAL),
- * because the worker processes are not supposed to live beyond an error anyway.
- */
 
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
@@ -339,11 +334,11 @@ RegisterWorker(int id)
 	MemSet(&worker, 0, sizeof(worker));
 
 	worker.bgw_main_arg = Int32GetDatum(id);
+	worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 
 	if (id == 0)
 	{
 		/* Register the BufferSaver background worker */
-		worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= 0;	/* Keep the BufferSaver running */
 		worker.bgw_main			= BufferSaverMain;
@@ -352,7 +347,6 @@ RegisterWorker(int id)
 	else
 	{
 		/* Register a BlockReader background worker process */
-		worker.bgw_flags		= BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time	= BgWorkerStart_ConsistentState;
 		worker.bgw_restart_time	= BGW_NEVER_RESTART;	/* Don't restart BlockReaders upon error */
 		worker.bgw_main			= BlockReaderMain;
@@ -402,11 +396,14 @@ BlockReaderMain(Datum main_arg)
 	 * error that occurred earlier.
 	 */
 	errno = 0;
+
+	/* Scan the directory looking for file this worker is assigned to. */
 	while ((dent = readdir(dir)) != NULL)
 	{
 		if (!parseSavefileName(dent->d_name, &filenum, dbname))
 			continue;
 
+		/* Stop if this is the file assigned to this worker. */
 		if (filenum == id)
 			break;
 	}
@@ -525,6 +522,9 @@ ReadBlocks(int filenum, char *dbname)
 		/* Stop processing the save-file if the Postmaster wants us to die. */
 		if (got_sigterm)
 			break;
+
+		ereport(log_level,
+				(errmsg("record type %x - %c", record_type, record_type)));
 
 		switch (record_type)
 		{
@@ -813,7 +813,14 @@ SaveBuffers(void)
 	for (i = NUM_BUFFER_PARTITIONS - 1; i >= 0; --i)
 		LWLockRelease(FirstBufMappingLock + i);
 
-	/* Sort the list, so that we can optimize the storage of these buffers. */
+	/*
+	 * Sort the list, so that we can optimize the storage of these buffers.
+	 *
+	 * The side-effect of this storage optimization is that when reading the
+	 * blocks back from relation forks, it leads to sequential reads, which
+	 * improve the restore speeds quite considerably as compared to random reads
+	 * from different blocks all over the data directory.
+	 */
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
 
 	/*
@@ -838,8 +845,8 @@ SaveBuffers(void)
 		if (i == 0 && buf->database == InvalidOid)
 		{
 			/*
-			 * Special case for global objects, if any. The sort would've
-			 * brought them to the front of the list.
+			 * Special case for global objects. The sort would've brought them
+			 * to the front of the list.
 			 */
 
 			savefile_name = getDatabaseSavefileName(database_counter, "global");
@@ -853,8 +860,9 @@ SaveBuffers(void)
 			char *dbname;
 
 			/*
-			 * We are beginning to process a different database than the previous one;
-			 * close the save-file of previous database, and open a new one.
+			 * We are beginning to process a different database than the
+			 * previous one; close the save-file of previous database, and open
+			 * a new one.
 			 */
 			++database_counter;
 
@@ -894,8 +902,8 @@ SaveBuffers(void)
 		if (buf->forknum != prev_forknum)
 		{
 			/*
-			 * We're beginning to process a new fork of this relation; add a record
-			 * for it.
+			 * We're beginning to process a new fork of this relation; add a
+			 * record for it.
 			 */
 			fileWrite("f", 1, 1, file, savefile_name);
 			fileWrite(&(buf->forknum), sizeof(ForkNumber), 1, file, savefile_name);
@@ -925,7 +933,7 @@ SaveBuffers(void)
 		{
 			SavedBuffer *tmp = &saved_buffers[j];
 
-			if (tmp->database == prev_database
+			if (tmp->database		== prev_database
 				&& tmp->filenode	== prev_filenode
 				&& tmp->forknum		== prev_forknum
 				&& tmp->blocknum	== (prev_blocknum + range_counter + 1))
