@@ -76,7 +76,7 @@ When the Postgres server is being stopped/shut down, the `Buffer Saver` scans th
 shared-buffers of Postgres, and stores the unique block identifiers of each cached
 block to the disk. This information is saved under the `$PGDATA/pg_hibernator/`
 directory. For each of the database whose blocks are resident in shared buffers,
-one file is created; for eg.: `$PGDATA/pg_hibernator/2.postgres.save`.
+one file is created; for eg.: `$PGDATA/pg_hibernator/2.save`.
 
 During the next startup sequence, the `Block Reader` threads are registerd, one for
 each file present under `$PGDATA/pg_hibernator/` directory. When the Postgres server

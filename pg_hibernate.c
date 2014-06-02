@@ -2,35 +2,7 @@
 
 #if PG_VERSION_NUM >= 90400
 
-#include <sys/stat.h>
-#include <unistd.h>
-
-/* These are always necessary for a bgworker */
-#include "miscadmin.h"
-#include "postmaster/bgworker.h"
-#include "storage/ipc.h"
-#include "storage/latch.h"
-#include "storage/lwlock.h"
-#include "storage/proc.h"
-#include "storage/shmem.h"
-
-/* Header files needed by this extension */
-#include "access/xact.h"
-#include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
-#include "executor/spi.h"
-#include "fmgr.h"
-#include "nodes/pg_list.h"
-#include "pgstat.h"
-#include "storage/block.h"
-#include "storage/buf_internals.h"
-#include "storage/bufmgr.h"
-#include "storage/fd.h"
-#include "storage/relfilenode.h"
-#include "utils/guc.h"
-#include "utils/memutils.h"
-#include "utils/snapmgr.h"
-#include "utils/rel.h"
+#include "pg_hibernator.h"
 
 PG_MODULE_MAGIC;
 
@@ -57,6 +29,10 @@ PG_MODULE_MAGIC;
  * When launched, the BlockReader reads the save-file assigned to it, connects
  * to the database represented by that save-file, and restores the blocks
  * identified by the list of blocks in save-file.
+ *
+ * Database numbers (and hence save-files with names) 0 and 1 are reserved;
+ * In _PG_init() 0 is used to identify and register the BufferSaver, and 1 is
+ * reserved in BufferSaver for save-file that contains global objects.
  */
 
 typedef struct SavedBuffer
@@ -68,10 +44,6 @@ typedef struct SavedBuffer
 							/* On-disk marker: 'N', for range of N blocks */
 } SavedBuffer;
 
-/* Forward declarations */
-
-#define SAVE_LOCATION "pg_hibernator"
-
 /* Primary functions */
 void			_PG_init(void);
 static void		DefineGUCs(void);
@@ -81,7 +53,7 @@ static void		RegisterBlockReaders(void);
 static bool		RegisterWorker(int id, BackgroundWorkerHandle **handle);
 
 static void		BlockReaderMain(Datum main_arg);
-static void		ReadBlocks(int filenum, char *dbname);
+static void		ReadBlocks(int filenum);
 
 static void		BufferSaverMain(Datum main_arg);
 static void		SaveBuffers(void);
@@ -96,12 +68,6 @@ static void		processOnePendingWorker(void);
 static void		WorkerCommon(void);
 static int		SavedBufferCmp(const void *a, const void *b);
 static Oid		GetRelOid(Oid filenode);
-static bool		parseSavefileName(const char *fname, int *filenum, char *dbname);
-static FILE*	fileOpen(const char *path, const char *mode);
-static bool		fileClose(FILE *file, const char *path);
-static bool		fileRead(void *dest, size_t size, size_t n, FILE *file, bool eof_ok, const char *path);
-static bool		fileWrite(const void *src, size_t size, size_t n, FILE *file, const char *path);
-static const char* getDatabaseSavefileName(int filenum, const char* const dbname);
 
 /* Global variables */
 static List *pendingWorkers = NIL;	/* Used by BufferSaver */
@@ -282,10 +248,9 @@ RegisterBlockReaders(void)
 	while ((dent = readdir(dir)) != NULL)
 	{
 		int		filenum;
-		char	dbname[NAMEDATALEN];
 
 		/* Skip worker creation if we can't parse the file name. */
-		if (!parseSavefileName(dent->d_name, &filenum, dbname))
+		if (!parseSavefileName(dent->d_name, &filenum))
 			continue;
 
 		addPendingWorker(filenum);
@@ -407,7 +372,6 @@ BlockReaderMain(Datum main_arg)
 	const char		   *hibernate_dir = SAVE_LOCATION;
 	struct dirent	   *dent;
 	int					filenum;
-	char				dbname[NAMEDATALEN];
 
 	WorkerCommon();
 
@@ -427,7 +391,7 @@ BlockReaderMain(Datum main_arg)
 	/* Scan the directory looking for file this worker is assigned to. */
 	while ((dent = readdir(dir)) != NULL)
 	{
-		if (!parseSavefileName(dent->d_name, &filenum, dbname))
+		if (!parseSavefileName(dent->d_name, &filenum))
 			continue;
 
 		/* Stop if this is the file assigned to this worker. */
@@ -452,7 +416,7 @@ BlockReaderMain(Datum main_arg)
 
 	/* We found the file we're supposed to restore. */
 
-	ReadBlocks(filenum, dbname);
+	ReadBlocks(filenum);
 
 	/*
 	 * Exit with non-zero status to ensure that this worker is not restarted.
@@ -472,10 +436,11 @@ BlockReaderMain(Datum main_arg)
 }
 
 static void
-ReadBlocks(int filenum, char *dbname)
+ReadBlocks(int filenum)
 {
 	FILE	   *file;
 	char		record_type;
+	char	   *dbname;
 	Oid			record_filenode;
 	ForkNumber	record_forknum;
 	BlockNumber	record_blocknum;
@@ -489,7 +454,7 @@ ReadBlocks(int filenum, char *dbname)
 	bool		skip_block		= false;
 	BlockNumber	nblocks			= 0;
 	BlockNumber	blocks_restored	= 0;
-	const char *filename;
+	const char *filepath;
 
 	/*
 	 * If this condition changes, then this code, and the code in the writer
@@ -498,8 +463,16 @@ ReadBlocks(int filenum, char *dbname)
 	 */
 	StaticAssertStmt(MaxBlockNumber == 0xFFFFFFFE, "Code may need review.");
 
-	filename = getDatabaseSavefileName(filenum, dbname);
-	file = fileOpen(filename, PG_BINARY_R);
+	filepath = getSavefileName(filenum);
+	file = fileOpen(filepath, PG_BINARY_R);
+	dbname = readDBName(file, filepath);
+
+	/*
+	 * When restoring global objects, the dbname is zero-length string, and non-
+	 * zero length otherwise. And filenum is never expected to be smaller than 1.
+	 */
+	Assert(filenum >= 1);
+	Assert(filenum == 1 ? strlen(dbname) == 0 : strlen(dbname) > 0);
 
 	/* To restore the global objects, use default database */
 	BackgroundWorkerInitializeConnection(filenum == 1 ? guc_default_database : dbname, NULL);
@@ -513,7 +486,7 @@ ReadBlocks(int filenum, char *dbname)
 	 * Note that in case of a read error, we will leak relcache entry that we may
 	 * currently have open. In case of EOF, we close the relation after the loop.
 	 */
-	while (fileRead(&record_type, 1, 1, file, true, filename))
+	while (fileRead(&record_type, 1, file, true, filepath))
 	{
 		/*
 		 * If we want to process the signals, this seems to be the best place
@@ -552,7 +525,7 @@ ReadBlocks(int filenum, char *dbname)
 				record_blocknum = InvalidBlockNumber;
 				nblocks = 0;
 
-				fileRead(&record_filenode, sizeof(Oid), 1, file, false, filename);
+				fileRead(&record_filenode, sizeof(Oid), file, false, filepath);
 
 				relOid = GetRelOid(record_filenode);
 
@@ -579,7 +552,7 @@ ReadBlocks(int filenum, char *dbname)
 				record_blocknum = InvalidBlockNumber;
 				nblocks = 0;
 
-				fileRead(&record_forknum, sizeof(ForkNumber), 1, file, false, filename);
+				fileRead(&record_forknum, sizeof(ForkNumber), file, false, filepath);
 
 				if (skip_relation)
 					continue;
@@ -606,7 +579,7 @@ ReadBlocks(int filenum, char *dbname)
 					ereport(ERROR,
 							(errmsg("found a block record without a preceeding fork record")));
 
-				fileRead(&record_blocknum, sizeof(BlockNumber), 1, file, false, filename);
+				fileRead(&record_blocknum, sizeof(BlockNumber), file, false, filepath);
 
 				if (skip_relation || skip_fork)
 					continue;
@@ -651,7 +624,7 @@ ReadBlocks(int filenum, char *dbname)
 					ereport(ERROR,
 							(errmsg("found a block range record without a preceeding block record")));
 
-				fileRead(&record_range, sizeof(int), 1, file, false, filename);
+				fileRead(&record_range, sizeof(int), file, false, filepath);
 
 				if (skip_relation || skip_fork || skip_block)
 					continue;
@@ -707,13 +680,13 @@ ReadBlocks(int filenum, char *dbname)
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
 
-	fileClose(file, filename);
+	fileClose(file, filepath);
 
 	/* Remove the save-file */
-	if (remove(filename) != 0)
+	if (remove(filepath) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				errmsg("error removing file \"%s\" : %m", filename)));
+				errmsg("error removing file \"%s\" : %m", filepath)));
 }
 
 static void
@@ -780,13 +753,13 @@ SaveBuffers(void)
 	SavedBuffer			   *saved_buffers;
 	volatile BufferDesc	   *bufHdr;			// XXX: Do we really need volatile here?
 	FILE				   *file			= NULL;
-	int						database_counter;
+	int						database_counter= 0;
 	Oid						prev_database	= InvalidOid;
 	Oid						prev_filenode	= InvalidOid;
 	ForkNumber				prev_forknum	= InvalidForkNumber;
 	BlockNumber				prev_blocknum	= InvalidBlockNumber;
 	BlockNumber				range_counter	= 0;
-	const char			   *savefile_name;
+	const char			   *savefile_path;
 
 	/*
 	 * XXX: If the memory request fails, ask for a smaller memory chunk, and use
@@ -837,13 +810,6 @@ SaveBuffers(void)
 	 */
 	pg_qsort(saved_buffers, num_buffers, sizeof(SavedBuffer), SavedBufferCmp);
 
-	/*
-	 * Database numbers 0 and 1 are reserved; In _PG_init() 0 is used to
-	 * identify and register the BufferSaver, and 1 is reserved here for
-	 * save-file that contains global objects.
-	 */
-	database_counter = 1;
-
 	/* Connect to the database and start a transaction for database name lookups. */
 	BackgroundWorkerInitializeConnection(guc_default_database, NULL);
 	SetCurrentStatementStartTimestamp();
@@ -856,15 +822,25 @@ SaveBuffers(void)
 		int j;
 		SavedBuffer *buf = &saved_buffers[i];
 
-		if (i == 0 && buf->database == InvalidOid)
+		if (i == 0)
 		{
 			/*
-			 * Special case for global objects. The sort would've brought them
-			 * to the front of the list.
+			 * Special case for global objects. The sort brings them to the
+			 * front of the list.
 			 */
 
-			savefile_name = getDatabaseSavefileName(database_counter, "global");
-			file = fileOpen(savefile_name, PG_BINARY_W);
+			/* Make sure the first buffer we save belongs to global object. */
+			Assert(buf->database == InvalidOid);
+
+			/*
+			 * Database number (and save-file name) 1 is reserverd for storing
+			 * list of buffers of global objects.
+			 */
+			database_counter = 1;
+
+			savefile_path = getSavefileName(database_counter);
+			file = fileOpen(savefile_path, PG_BINARY_W);
+			writeDBName("", file, savefile_path);
 
 			prev_database = buf->database;
 		}
@@ -885,10 +861,11 @@ SaveBuffers(void)
 			Assert(dbname != NULL);
 
 			if (file != NULL)
-				fileClose(file, savefile_name);
+				fileClose(file, savefile_path);
 
-			savefile_name = getDatabaseSavefileName(database_counter, dbname);
-			file = fileOpen(savefile_name, PG_BINARY_W);
+			savefile_path = getSavefileName(database_counter);
+			file = fileOpen(savefile_path, PG_BINARY_W);
+			writeDBName(dbname, file, savefile_path);
 
 			pfree(dbname);
 
@@ -903,8 +880,8 @@ SaveBuffers(void)
 		if (buf->filenode != prev_filenode)
 		{
 			/* We're beginning to process a new relation; emit a record for it. */
-			fileWrite("r", 1, 1, file, savefile_name);
-			fileWrite(&(buf->filenode), sizeof(Oid), 1, file, savefile_name);
+			fileWrite("r", 1, file, savefile_path);
+			fileWrite(&(buf->filenode), sizeof(Oid), file, savefile_path);
 
 			/* Reset trackers appropriately */
 			prev_filenode	= buf->filenode;
@@ -919,8 +896,8 @@ SaveBuffers(void)
 			 * We're beginning to process a new fork of this relation; add a
 			 * record for it.
 			 */
-			fileWrite("f", 1, 1, file, savefile_name);
-			fileWrite(&(buf->forknum), sizeof(ForkNumber), 1, file, savefile_name);
+			fileWrite("f", 1, file, savefile_path);
+			fileWrite(&(buf->forknum), sizeof(ForkNumber), file, savefile_path);
 
 			/* Reset trackers appropriately */
 			prev_forknum	= buf->forknum;
@@ -932,8 +909,8 @@ SaveBuffers(void)
 				(errmsg("writer: writing block db %d filenode %d forknum %d blocknum %d",
 						database_counter, prev_filenode, prev_forknum, buf->blocknum)));
 
-		fileWrite("b", 1, 1, file, savefile_name);
-		fileWrite(&(buf->blocknum), sizeof(BlockNumber), 1, file, savefile_name);
+		fileWrite("b", 1, file, savefile_path);
+		fileWrite(&(buf->blocknum), sizeof(BlockNumber), file, savefile_path);
 
 		prev_blocknum = buf->blocknum;
 
@@ -962,8 +939,8 @@ SaveBuffers(void)
 				(errmsg("writer: writing range db %d filenode %d forknum %d blocknum %d range %d",
 						database_counter, prev_filenode, prev_forknum, prev_blocknum, range_counter)));
 
-			fileWrite("N", 1, 1, file, savefile_name);
-			fileWrite(&range_counter, sizeof(range_counter), 1, file, savefile_name);
+			fileWrite("N", 1, file, savefile_path);
+			fileWrite(&range_counter, sizeof(range_counter), file, savefile_path);
 
 			i += range_counter;
 		}
@@ -973,7 +950,7 @@ SaveBuffers(void)
 			(errmsg("Buffer Saver: saved metadata of %d blocks", num_buffers)));
 
 	Assert(file != NULL);
-	fileClose(file, savefile_name);
+	fileClose(file, savefile_path);
 
 	pfree(saved_buffers);
 
@@ -1043,104 +1020,6 @@ GetRelOid(Oid filenode)
 		return InvalidOid;
 
 	return relid;
-}
-
-/* Returns FILE* on success, doesn't return on error */
-static FILE*
-fileOpen(const char *path, const char *mode)
-{
-	FILE *file = fopen(path, mode);
-	if (file == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open \"%s\": %m", path)));
-
-	return file;
-}
-
-/* Returns true on success, doesn't return on error */
-static bool
-fileClose(FILE *file, const char *path)
-{
-	int rc;
-
-	rc = fclose(file);
-	if (rc != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				errmsg("encountered error %d while closing file \"%s\": %m",
-						rc, path)));
-
-	return true;
-}
-
-/* Returns true on success, doesn't return on error. */
-static bool
-fileRead(void *dest, size_t size, size_t n, FILE *file, bool eof_ok, const char *path)
-{
-	if (fread(dest, size, n, file) != n)
-	{
-		if (feof(file))
-		{
-			if (eof_ok)
-				return false;
-			else
-				ereport(ERROR,
-						(errmsg("found EOF when not expecting one \"%s\"", path)));
-		}
-		else
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					errmsg("error reading \"%s\" : %m", path)));
-	}
-
-	return true;
-}
-
-/* Returns true on success, doesn't return on error. */
-static bool
-fileWrite(const void *src, size_t size, size_t n, FILE *file, const char *path)
-{
-	if (fwrite(src, size, n, file) != n)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				errmsg("error writing to \"%s\" : %m", path)));
-
-	return true;
-}
-
-/*
- * We use static array here, because the returned pointer is not modified by
- * the callers, and they call this function everytime they need new value.
- */
-static const char*
-getDatabaseSavefileName(int filenum, const char *dbname)
-{
-	static char ret[MAXPGPATH];
-
-	snprintf(ret, sizeof(ret), "%s/%d.%s.save", SAVE_LOCATION, filenum, dbname);
-
-	return ret;
-}
-
-static bool
-parseSavefileName(const char *fname, int *filenum, char *dbname)
-{
-	int dbname_len;
-
-	/* The save-file name format is: <integer>.<dbname>.save */
-
-	if (sscanf(fname, "%d.%s", filenum, dbname) != 2)
-		return false;	/* Fail if the name doesn't match the format we're expecting */
-
-	dbname_len = strlen(dbname);
-
-	if (strcmp(&dbname[dbname_len - 5], ".save") != 0)
-		return false;	/* Fail if the name doesn't match the format we're expecting */
-
-	dbname[dbname_len - 5] = '\0';
-
-	return true;
 }
 
 #endif /* PG_VERSION_NUM >= 90400 */
