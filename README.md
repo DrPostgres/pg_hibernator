@@ -155,7 +155,7 @@ can be set in postgresql.conf or on postmaster's command-line.
     I looked at `pgfincore`, but decided against including that feature-set
     in Postgres Hibernator because, (a) `pgfincore` requires the user to know
     beforehand which tables/indexes they will need in future, and (b) Postgres
-    Hibernator is supposed to be as invisible to the user/DBA as possible.
+    Hibernator is supposed to be as invisible to the user/DBA as much as possible.
 
     One possible solution is to hook into Postgres' buffer-eviction code (at the
     end of `BufferAlloc()`), and keep track of which buffers are being evicted.
