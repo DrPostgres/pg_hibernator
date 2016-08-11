@@ -194,7 +194,7 @@ can be set in postgresql.conf or on postmaster's command-line.
     + pg_hibernator:
 
         Upon shutdown, save list of blocks stored in shared buffers. Upon
-        startup, loads those blocks back into shared buffers.
+        startup, load those blocks back into shared buffers.
 
     The goal of Postgres Hibernator is to be invisible to the user/DBA.
     Whereas with `pg_prewarm` the user needs to know a lot of stuff about
@@ -237,9 +237,9 @@ can be set in postgresql.conf or on postmaster's command-line.
 
     [Proposal](http://www.postgresql.org/message-id/CABwTF4Ui_anAG+ybseFunAH5Z6DE9aw2NPdy4HryK+M5OdXCCA@mail.gmail.com)
 
-    [Introducing Postrges Hibernator](http://gurjeet.singh.im/blog/2014/02/03/introducing-postgres-hibernator/)
+    [Introducing Postgres Hibernator](http://gurjeet.singh.im/blog/2014/02/03/introducing-postgres-hibernator/)
 
-    [Demostrating Performance Benefits](http://gurjeet.singh.im/blog/2014/04/30/postgres-hibernator-reduce-planned-database-down-times/)
+    [ Demonstrating Performance Benefits](http://gurjeet.singh.im/blog/2014/04/30/postgres-hibernator-reduce-planned-database-down-times/)
 
 [postgres_site]: http://www.postgresql.org
 [ppas_site]: http://enterprisedb.com/products-services-training/products/postgres-plus-advanced-server
