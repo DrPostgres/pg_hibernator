@@ -139,7 +139,7 @@ can be set in postgresql.conf or on postmaster's command-line.
 - A reduction in `shared_buffers` is not detected.
 
     If the `shared_buffers` is reduced across a restart, and if the combined
-    saved buffer list is larger than the new shared_buffers lize, Postgres
+    saved buffer list is larger than the new shared_buffers size, Postgres
     Hibernator continues to read and restore blocks even after `shared_buffers`
     worth of buffers have been restored.
 
